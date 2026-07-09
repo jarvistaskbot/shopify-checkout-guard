@@ -3,14 +3,10 @@ Anomaly detection engine — order volume based.
 
 Algorithm:
   1. On every orders/create webhook, count orders in a 30-min sliding window.
-  2. Fetch 7-day rolling baseline for the same hour-of-day (±1 h).
+  2. Fetch 7-day rolling baseline for the same hour-of-day (+-1 h).
   3. If current_volume < baseline * (1 - threshold/100) for 3+ consecutive
-     triggers → open an incident.
+     triggers -> open an incident.
   4. Resolve when volume recovers within 10% of baseline for 2 consecutive checks.
-
-Note: checkouts/create requires Shopify protected-customer-data approval.
-We detect anomalies using order volume alone, which still surfaces revenue bleed
-(payment failures, checkout bugs, traffic drops) without needing PII-scoped topics.
 """
 
 from __future__ import annotations
@@ -29,10 +25,6 @@ _BASELINE_DAYS = 7
 _CONSECUTIVE_DROPS_REQUIRED = 3
 _RECOVERY_CHECKS_REQUIRED = 2
 
-# Per-shop in-memory streak counters (reset on restart — acceptable for dev).
-_drop_streak: dict[str, int] = {}
-_recovery_streak: dict[str, int] = {}
-
 
 async def process_event(shop_domain: str) -> None:
     """Called after every orders/create insertion. Runs detection in background."""
@@ -44,18 +36,23 @@ async def _run_check(shop_domain: str) -> None:
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT alert_threshold_pct, active FROM merchants WHERE shop_domain = $1",
+                """
+                SELECT alert_threshold_pct, active, drop_streak, recovery_streak, avg_order_value
+                FROM merchants WHERE shop_domain = $1
+                """,
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
                 return
 
             threshold_pct = merchant["alert_threshold_pct"]
+            drop_streak = merchant["drop_streak"]
+            recovery_streak = merchant["recovery_streak"]
+            avg_order_value = float(merchant["avg_order_value"])
             now = datetime.now(timezone.utc)
 
             current_volume = await _current_volume(conn, shop_domain, now)
             baseline_volume = await _baseline_volume(conn, shop_domain, now)
-            avg_order_value = _default_aov()
 
             if baseline_volume is None or baseline_volume == 0:
                 return
@@ -64,11 +61,18 @@ async def _run_check(shop_domain: str) -> None:
             is_dropping = drop_pct >= threshold_pct
 
             if is_dropping:
-                _drop_streak[shop_domain] = _drop_streak.get(shop_domain, 0) + 1
-                _recovery_streak[shop_domain] = 0
+                drop_streak += 1
+                recovery_streak = 0
             else:
-                _recovery_streak[shop_domain] = _recovery_streak.get(shop_domain, 0) + 1
-                _drop_streak[shop_domain] = 0
+                recovery_streak += 1
+                drop_streak = 0
+
+            await conn.execute(
+                "UPDATE merchants SET drop_streak = $1, recovery_streak = $2 WHERE shop_domain = $3",
+                drop_streak,
+                recovery_streak,
+                shop_domain,
+            )
 
             active_incident = await conn.fetchrow(
                 "SELECT id, started_at FROM incidents WHERE shop_domain = $1 AND resolved_at IS NULL",
@@ -76,7 +80,7 @@ async def _run_check(shop_domain: str) -> None:
             )
 
             if not active_incident:
-                if _drop_streak.get(shop_domain, 0) >= _CONSECUTIVE_DROPS_REQUIRED:
+                if drop_streak >= _CONSECUTIVE_DROPS_REQUIRED:
                     rev_loss_per_min = _revenue_loss_per_minute(
                         baseline_volume, current_volume, avg_order_value
                     )
@@ -97,30 +101,31 @@ async def _run_check(shop_domain: str) -> None:
                     await _notify(conn, shop_domain, incident_id, baseline_volume, current_volume, rev_loss_per_min)
             else:
                 recovery_threshold = baseline_volume * 0.9
-                if current_volume >= recovery_threshold:
-                    if _recovery_streak.get(shop_domain, 0) >= _RECOVERY_CHECKS_REQUIRED:
-                        await conn.execute(
-                            "UPDATE incidents SET resolved_at = $1 WHERE id = $2",
-                            now,
-                            active_incident["id"],
+                if current_volume >= recovery_threshold and recovery_streak >= _RECOVERY_CHECKS_REQUIRED:
+                    await conn.execute(
+                        "UPDATE incidents SET resolved_at = $1 WHERE id = $2",
+                        now,
+                        active_incident["id"],
+                    )
+                    await conn.execute(
+                        "UPDATE merchants SET drop_streak = 0, recovery_streak = 0 WHERE shop_domain = $1",
+                        shop_domain,
+                    )
+                    slack_row = await conn.fetchrow(
+                        "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
+                        shop_domain,
+                    )
+                    if slack_row and slack_row["slack_webhook_url"]:
+                        from services.alerter import send_recovery_alert
+                        duration_minutes = int(
+                            (now - active_incident["started_at"]).total_seconds() / 60
                         )
-                        _drop_streak[shop_domain] = 0
-                        _recovery_streak[shop_domain] = 0
-                        merchant = await conn.fetchrow(
-                            "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
-                            shop_domain,
+                        await send_recovery_alert(
+                            webhook_url=slack_row["slack_webhook_url"],
+                            shop_domain=shop_domain,
+                            incident_id=active_incident["id"],
+                            duration_minutes=duration_minutes,
                         )
-                        if merchant and merchant["slack_webhook_url"]:
-                            from services.alerter import send_recovery_alert
-                            duration_minutes = int(
-                                (now - active_incident["started_at"]).total_seconds() / 60
-                            )
-                            await send_recovery_alert(
-                                webhook_url=merchant["slack_webhook_url"],
-                                shop_domain=shop_domain,
-                                incident_id=active_incident["id"],
-                                duration_minutes=duration_minutes,
-                            )
     except Exception as exc:
         import logging
         logging.getLogger(__name__).error("Detection error for %s: %s", shop_domain, exc)
@@ -150,7 +155,6 @@ async def _baseline_volume(
     hour = now.hour
     since = now - timedelta(days=_BASELINE_DAYS)
 
-    # Count total orders in the same hour window across 7 days, then average.
     total = await conn.fetchval(
         """
         SELECT COUNT(*) FROM checkout_events
@@ -168,13 +172,9 @@ async def _baseline_volume(
     if total == 0:
         return None
 
-    # Number of 30-min slots in a 3-hour window over 7 days = 7 * 6 = 42
+    # 30-min slots in a 3-hour window over 7 days = 7 * 6 = 42
     slots = _BASELINE_DAYS * 6
     return total / slots
-
-
-def _default_aov() -> float:
-    return 50.0
 
 
 def _revenue_loss_per_minute(

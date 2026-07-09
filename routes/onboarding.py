@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Form, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from database import get_pool
 
@@ -39,7 +39,6 @@ button {
     font-weight: 600;
 }
 button:hover { background: #006e52; }
-.success-icon { font-size: 40px; margin-bottom: 16px; }
 """
 
 
@@ -71,18 +70,18 @@ async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
       placeholder="https://hooks.slack.com/services/T.../B.../..."
       required
     />
-    <button type="submit">Save and activate alerts</button>
+    <button type="submit">Continue to billing &rarr;</button>
   </form>
 </body>
 </html>"""
     return HTMLResponse(content=html)
 
 
-@router.post("/onboarding", response_class=HTMLResponse)
+@router.post("/onboarding")
 async def onboarding_save(
     shop: str = Form(...),
     slack_webhook_url: str = Form(...),
-) -> HTMLResponse:
+) -> RedirectResponse:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -90,25 +89,60 @@ async def onboarding_save(
             slack_webhook_url,
             shop,
         )
+    return RedirectResponse(url=f"/billing/start?shop={shop}", status_code=303)
 
+
+@router.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy() -> HTMLResponse:
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>CheckoutGuard — Active</title>
-  <style>{_STYLE}</style>
+  <title>CheckoutGuard — Privacy Policy</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      max-width: 720px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.7;
+    }}
+    h1 {{ font-size: 24px; }}
+    h2 {{ font-size: 17px; margin-top: 32px; }}
+    p, li {{ color: #333; font-size: 15px; }}
+  </style>
 </head>
 <body>
-  <div class="success-icon">&#x2705;</div>
-  <h1>You&rsquo;re all set</h1>
-  <p class="sub">
-    CheckoutGuard is monitoring <strong>{shop}</strong>.<br>
-    You&rsquo;ll receive a Slack alert if order volume drops &ge;20% below your 7-day baseline.
+  <h1>Privacy Policy — CheckoutGuard</h1>
+  <p><em>Last updated: July 2026</em></p>
+
+  <h2>What we collect</h2>
+  <p>CheckoutGuard collects the minimum data required to detect revenue anomalies:</p>
+  <ul>
+    <li>Your Shopify store domain (e.g. <code>your-store.myshopify.com</code>)</li>
+    <li>Order creation timestamps and order IDs (not customer names, emails, or payment details)</li>
+    <li>Your Slack Incoming Webhook URL (stored encrypted, used only to send you alerts)</li>
+  </ul>
+
+  <h2>What we do not collect</h2>
+  <ul>
+    <li>Customer names, email addresses, or any PII</li>
+    <li>Payment or billing card data</li>
+    <li>Product details or inventory data</li>
+  </ul>
+
+  <h2>How we use your data</h2>
+  <p>
+    Order timestamps are used solely to compute a rolling baseline of your normal order volume.
+    When the volume drops significantly, we send an alert to your configured Slack channel.
+    We do not share, sell, or use your data for any other purpose.
   </p>
-  <p class="sub">
-    Baseline builds automatically over the first 7 days of traffic.
-    Alerts fire after 3 consecutive drops are detected.
+
+  <h2>Data retention</h2>
+  <p>
+    Order event records are retained for 30 days to maintain a rolling baseline.
+    When you uninstall CheckoutGuard, your store data is deleted within 48 hours.
   </p>
+
+  <h2>Contact</h2>
+  <p>For data requests or questions, contact: <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
 </body>
 </html>"""
     return HTMLResponse(content=html)

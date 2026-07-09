@@ -5,6 +5,8 @@ Shopify webhook handlers with HMAC verification.
 import base64
 import hashlib
 import hmac
+import json
+import logging
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
@@ -12,6 +14,7 @@ from config import settings
 from database import get_pool
 from services.detector import process_event
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks")
 
 
@@ -36,7 +39,6 @@ async def order_created(
     x_shopify_shop_domain: str = Header(...),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
-    import json
     payload = json.loads(body)
     order_id = str(payload.get("id", ""))
     checkout_token = payload.get("checkout_token", "")
@@ -64,7 +66,6 @@ async def checkout_created(
     x_shopify_shop_domain: str = Header(...),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
-    import json
     payload = json.loads(body)
     checkout_token = payload.get("token", "")
 
@@ -90,7 +91,6 @@ async def checkout_deleted(
     x_shopify_shop_domain: str = Header(...),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
-    import json
     payload = json.loads(body)
     checkout_token = payload.get("token", "")
 
@@ -123,4 +123,54 @@ async def app_uninstalled(
             x_shopify_shop_domain,
         )
 
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# GDPR mandatory webhooks (required for Shopify App Store review)
+# ---------------------------------------------------------------------------
+
+@router.post("/customers/data_request")
+async def customers_data_request(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(...),
+) -> dict:
+    """Shopify requests what customer data we hold for a given customer."""
+    await _verify_hmac(request, x_shopify_hmac_sha256)
+    # We do not store customer PII — only order timestamps and order IDs.
+    # No further action required.
+    logger.info("GDPR customers/data_request received — no PII stored")
+    return {"ok": True}
+
+
+@router.post("/customers/redact")
+async def customers_redact(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(...),
+) -> dict:
+    """Shopify requests deletion of customer data."""
+    await _verify_hmac(request, x_shopify_hmac_sha256)
+    # We store no customer PII; order IDs are anonymised aggregates.
+    logger.info("GDPR customers/redact received — no PII to delete")
+    return {"ok": True}
+
+
+@router.post("/shop/redact")
+async def shop_redact(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(...),
+    x_shopify_shop_domain: str = Header(...),
+) -> dict:
+    """Shopify requests permanent deletion of all merchant data (48h after uninstall)."""
+    await _verify_hmac(request, x_shopify_hmac_sha256)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # CASCADE deletes checkout_events and incidents via FK constraints.
+        await conn.execute(
+            "DELETE FROM merchants WHERE shop_domain = $1 AND active = FALSE",
+            x_shopify_shop_domain,
+        )
+
+    logger.info("GDPR shop/redact: deleted data for %s", x_shopify_shop_domain)
     return {"ok": True}

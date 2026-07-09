@@ -9,9 +9,12 @@ Install URL pattern (offline token):
     &state={nonce}
 """
 
+import asyncio
 import hashlib
 import hmac
+import logging
 import secrets
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -20,6 +23,7 @@ import httpx
 from config import settings
 from database import get_pool
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth")
 
 _SCOPES = "read_orders"
@@ -51,7 +55,7 @@ async def callback(
     state: str = Query(...),
     hmac_param: str = Query(alias="hmac"),
     request: Request = None,
-) -> dict:
+) -> RedirectResponse:
     if state not in _pending_nonces:
         raise HTTPException(status_code=400, detail="Invalid state nonce")
     _pending_nonces.discard(state)
@@ -84,8 +88,6 @@ async def callback(
     access_token = token_data["access_token"]
     refresh_token = token_data.get("refresh_token")
     expires_in = token_data.get("expires_in")
-
-    from datetime import datetime, timezone, timedelta
     token_expires_at = (
         datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
         if expires_in else None
@@ -110,17 +112,20 @@ async def callback(
             token_expires_at,
         )
 
-    await _subscribe_webhooks(shop, access_token)
+    # Run non-blocking tasks: webhook registration and AOV fetch.
+    asyncio.create_task(_subscribe_webhooks(shop, access_token))
+    asyncio.create_task(_fetch_and_store_aov(shop, access_token))
 
     return RedirectResponse(url=f"/onboarding?shop={shop}")
 
 
 async def _subscribe_webhooks(shop: str, access_token: str) -> None:
-    import logging
-    logger = logging.getLogger(__name__)
     topics = [
         ("orders/create", "/webhooks/orders/create"),
         ("app/uninstalled", "/webhooks/app/uninstalled"),
+        ("customers/data_request", "/webhooks/customers/data_request"),
+        ("customers/redact", "/webhooks/customers/redact"),
+        ("shop/redact", "/webhooks/shop/redact"),
     ]
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await client.get(
@@ -139,6 +144,36 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
                 json={"webhook": {"topic": topic, "address": f"{settings.app_url}{path}", "format": "json"}},
             )
             if resp.status_code in (200, 201):
-                logger.info("Registered webhook: %s → %s", topic, settings.app_url + path)
+                logger.info("Registered webhook: %s", topic)
             else:
                 logger.error("Failed to register %s: %s", topic, resp.text)
+
+
+async def _fetch_and_store_aov(shop: str, access_token: str) -> None:
+    """Fetch recent orders from Shopify and compute real AOV for this merchant."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://{shop}/admin/api/2026-10/orders.json",
+                headers={"X-Shopify-Access-Token": access_token},
+                params={"status": "paid", "limit": 50, "fields": "total_price"},
+            )
+            if resp.status_code != 200:
+                return
+            orders = resp.json().get("orders", [])
+
+        prices = [float(o["total_price"]) for o in orders if o.get("total_price")]
+        if not prices:
+            return
+
+        aov = round(sum(prices) / len(prices), 2)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE merchants SET avg_order_value = $1 WHERE shop_domain = $2",
+                aov,
+                shop,
+            )
+        logger.info("AOV for %s set to $%.2f (from %d orders)", shop, aov, len(prices))
+    except Exception as exc:
+        logger.warning("AOV fetch failed for %s: %s", shop, exc)

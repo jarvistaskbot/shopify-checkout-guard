@@ -11,13 +11,32 @@ CREATE TABLE IF NOT EXISTS merchants (
 
 -- Idempotent column additions for deployments against an existing schema.
 DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='merchants' AND column_name='refresh_token') THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='refresh_token') THEN
         ALTER TABLE merchants ADD COLUMN refresh_token TEXT;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='merchants' AND column_name='token_expires_at') THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='token_expires_at') THEN
         ALTER TABLE merchants ADD COLUMN token_expires_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='drop_streak') THEN
+        ALTER TABLE merchants ADD COLUMN drop_streak INTEGER NOT NULL DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='recovery_streak') THEN
+        ALTER TABLE merchants ADD COLUMN recovery_streak INTEGER NOT NULL DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='avg_order_value') THEN
+        ALTER TABLE merchants ADD COLUMN avg_order_value NUMERIC(10,2) NOT NULL DEFAULT 50.00;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='billing_charge_id') THEN
+        ALTER TABLE merchants ADD COLUMN billing_charge_id TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='billing_status') THEN
+        ALTER TABLE merchants ADD COLUMN billing_status TEXT NOT NULL DEFAULT 'trialing';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='billing_activated_at') THEN
+        ALTER TABLE merchants ADD COLUMN billing_activated_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='trial_ends_at') THEN
+        ALTER TABLE merchants ADD COLUMN trial_ends_at TIMESTAMPTZ;
     END IF;
 END $$;
 

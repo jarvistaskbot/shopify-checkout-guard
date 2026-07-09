@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from config import settings
 from database import create_pool, get_pool
 from routes.auth import router as auth_router
+from routes.billing import router as billing_router
 from routes.onboarding import router as onboarding_router
 from routes.webhooks import router as webhook_router
 
@@ -53,6 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="CheckoutGuard", lifespan=lifespan)
 
 app.include_router(auth_router)
+app.include_router(billing_router)
 app.include_router(onboarding_router)
 app.include_router(webhook_router)
 
