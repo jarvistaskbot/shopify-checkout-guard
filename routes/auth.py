@@ -112,7 +112,7 @@ async def callback(
 
     await _subscribe_webhooks(shop, access_token)
 
-    return {"status": "installed", "shop": shop}
+    return RedirectResponse(url=f"/onboarding?shop={shop}")
 
 
 async def _subscribe_webhooks(shop: str, access_token: str) -> None:

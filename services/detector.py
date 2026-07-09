@@ -71,7 +71,7 @@ async def _run_check(shop_domain: str) -> None:
                 _drop_streak[shop_domain] = 0
 
             active_incident = await conn.fetchrow(
-                "SELECT id FROM incidents WHERE shop_domain = $1 AND resolved_at IS NULL",
+                "SELECT id, started_at FROM incidents WHERE shop_domain = $1 AND resolved_at IS NULL",
                 shop_domain,
             )
 
@@ -106,6 +106,21 @@ async def _run_check(shop_domain: str) -> None:
                         )
                         _drop_streak[shop_domain] = 0
                         _recovery_streak[shop_domain] = 0
+                        merchant = await conn.fetchrow(
+                            "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
+                            shop_domain,
+                        )
+                        if merchant and merchant["slack_webhook_url"]:
+                            from services.alerter import send_recovery_alert
+                            duration_minutes = int(
+                                (now - active_incident["started_at"]).total_seconds() / 60
+                            )
+                            await send_recovery_alert(
+                                webhook_url=merchant["slack_webhook_url"],
+                                shop_domain=shop_domain,
+                                incident_id=active_incident["id"],
+                                duration_minutes=duration_minutes,
+                            )
     except Exception as exc:
         import logging
         logging.getLogger(__name__).error("Detection error for %s: %s", shop_domain, exc)

@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 cryptography==42.0.8
 pydantic==2.7.1
 pydantic-settings==2.3.0
+python-multipart==0.0.9
