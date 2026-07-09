@@ -22,7 +22,7 @@ from database import get_pool
 
 router = APIRouter(prefix="/auth")
 
-_SCOPES = "read_orders,read_checkouts"
+_SCOPES = "read_orders"
 
 # In-memory nonce store (per-process; replace with Redis for multi-instance).
 _pending_nonces: set[str] = set()
@@ -82,18 +82,32 @@ async def callback(
         token_data = resp.json()
 
     access_token = token_data["access_token"]
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in")
+
+    from datetime import datetime, timezone, timedelta
+    token_expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+        if expires_in else None
+    )
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO merchants (shop_domain, access_token, active)
-            VALUES ($1, $2, TRUE)
+            INSERT INTO merchants (shop_domain, access_token, refresh_token, token_expires_at, active)
+            VALUES ($1, $2, $3, $4, TRUE)
             ON CONFLICT (shop_domain)
-            DO UPDATE SET access_token = EXCLUDED.access_token, active = TRUE
+            DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                token_expires_at = EXCLUDED.token_expires_at,
+                active = TRUE
             """,
             shop,
             access_token,
+            refresh_token,
+            token_expires_at,
         )
 
     await _subscribe_webhooks(shop, access_token)
@@ -102,21 +116,29 @@ async def callback(
 
 
 async def _subscribe_webhooks(shop: str, access_token: str) -> None:
-    base_url = f"{settings.app_url}/webhooks"
+    import logging
+    logger = logging.getLogger(__name__)
     topics = [
-        ("orders/create", f"{base_url}/orders/create"),
-        ("checkouts/create", f"{base_url}/checkouts/create"),
-        ("checkouts/delete", f"{base_url}/checkouts/delete"),
-        ("app/uninstalled", f"{base_url}/app/uninstalled"),
+        ("orders/create", "/webhooks/orders/create"),
+        ("app/uninstalled", "/webhooks/app/uninstalled"),
     ]
-    headers = {
-        "X-Shopify-Access-Token": access_token,
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        for topic, address in topics:
-            await client.post(
-                f"https://{shop}/admin/api/2024-04/webhooks.json",
-                headers=headers,
-                json={"webhook": {"topic": topic, "address": address, "format": "json"}},
+    async with httpx.AsyncClient(timeout=15) as client:
+        existing = await client.get(
+            f"https://{shop}/admin/api/2026-10/webhooks.json",
+            headers={"X-Shopify-Access-Token": access_token},
+        )
+        existing_topics = {w["topic"] for w in existing.json().get("webhooks", [])}
+
+        for topic, path in topics:
+            if topic in existing_topics:
+                logger.info("Webhook already registered: %s", topic)
+                continue
+            resp = await client.post(
+                f"https://{shop}/admin/api/2026-10/webhooks.json",
+                headers={"X-Shopify-Access-Token": access_token},
+                json={"webhook": {"topic": topic, "address": f"{settings.app_url}{path}", "format": "json"}},
             )
+            if resp.status_code in (200, 201):
+                logger.info("Registered webhook: %s → %s", topic, settings.app_url + path)
+            else:
+                logger.error("Failed to register %s: %s", topic, resp.text)

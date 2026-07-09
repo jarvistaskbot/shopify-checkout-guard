@@ -1,11 +1,25 @@
 CREATE TABLE IF NOT EXISTS merchants (
     shop_domain          TEXT PRIMARY KEY,
     access_token         TEXT NOT NULL,
+    refresh_token        TEXT,
+    token_expires_at     TIMESTAMPTZ,
     slack_webhook_url    TEXT,
     alert_threshold_pct  INTEGER NOT NULL DEFAULT 20,
     installed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     active               BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- Idempotent column additions for deployments against an existing schema.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='merchants' AND column_name='refresh_token') THEN
+        ALTER TABLE merchants ADD COLUMN refresh_token TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='merchants' AND column_name='token_expires_at') THEN
+        ALTER TABLE merchants ADD COLUMN token_expires_at TIMESTAMPTZ;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS checkout_events (
     id              BIGSERIAL PRIMARY KEY,

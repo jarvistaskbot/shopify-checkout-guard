@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,7 +11,14 @@ from routes.webhooks import router as webhook_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_pool(settings.database_url)
+    for attempt in range(10):
+        try:
+            await create_pool(settings.database_url)
+            break
+        except Exception:
+            if attempt == 9:
+                raise
+            await asyncio.sleep(3)
     yield
 
 
