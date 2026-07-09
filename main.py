@@ -73,5 +73,6 @@ app.include_router(webhook_router)
 
 
 @app.get("/")
+@app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "CheckoutGuard"}
