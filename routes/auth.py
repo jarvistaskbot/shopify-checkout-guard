@@ -26,7 +26,7 @@ from database import get_pool
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth")
 
-_SCOPES = "read_orders"
+_SCOPES = "read_orders,read_checkouts"
 
 # In-memory nonce store (per-process; replace with Redis for multi-instance).
 _pending_nonces: set[str] = set()
@@ -44,6 +44,7 @@ async def install(shop: str = Query(..., description="Shopify shop domain")) -> 
         f"&scope={_SCOPES}"
         f"&redirect_uri={callback}"
         f"&state={nonce}"
+        f"&grant_options%5B%5D=offline"
     )
     return RedirectResponse(url)
 
@@ -126,10 +127,12 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
         ("customers/data_request", "/webhooks/customers/data_request"),
         ("customers/redact", "/webhooks/customers/redact"),
         ("shop/redact", "/webhooks/shop/redact"),
+        ("checkouts/create", "/webhooks/checkouts/create"),
+        ("checkouts/delete", "/webhooks/checkouts/delete"),
     ]
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await client.get(
-            f"https://{shop}/admin/api/2026-10/webhooks.json",
+            f"https://{shop}/admin/api/2024-10/webhooks.json",
             headers={"X-Shopify-Access-Token": access_token},
         )
         existing_topics = {w["topic"] for w in existing.json().get("webhooks", [])}
@@ -139,7 +142,7 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
                 logger.info("Webhook already registered: %s", topic)
                 continue
             resp = await client.post(
-                f"https://{shop}/admin/api/2026-10/webhooks.json",
+                f"https://{shop}/admin/api/2024-10/webhooks.json",
                 headers={"X-Shopify-Access-Token": access_token},
                 json={"webhook": {"topic": topic, "address": f"{settings.app_url}{path}", "format": "json"}},
             )
@@ -154,7 +157,7 @@ async def _fetch_and_store_aov(shop: str, access_token: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                f"https://{shop}/admin/api/2026-10/orders.json",
+                f"https://{shop}/admin/api/2024-10/orders.json",
                 headers={"X-Shopify-Access-Token": access_token},
                 params={"status": "paid", "limit": 50, "fields": "total_price"},
             )

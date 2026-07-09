@@ -10,8 +10,19 @@ from routes.auth import router as auth_router
 from routes.billing import router as billing_router
 from routes.onboarding import router as onboarding_router
 from routes.webhooks import router as webhook_router
+from services.detector import run_proactive_checks_all_merchants
 
 logger = logging.getLogger(__name__)
+
+
+async def _proactive_monitor_loop() -> None:
+    """Run payment failure checks every 5 minutes for all active merchants."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await run_proactive_checks_all_merchants()
+        except Exception as exc:
+            logger.error("Proactive monitor loop error: %s", exc)
 
 
 async def _token_refresh_loop() -> None:
@@ -47,8 +58,10 @@ async def lifespan(app: FastAPI):
                 raise
             await asyncio.sleep(3)
     task = asyncio.create_task(_token_refresh_loop())
+    task2 = asyncio.create_task(_proactive_monitor_loop())
     yield
     task.cancel()
+    task2.cancel()
 
 
 app = FastAPI(title="CheckoutGuard", lifespan=lifespan)

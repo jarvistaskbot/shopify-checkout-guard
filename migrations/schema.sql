@@ -38,6 +38,15 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='trial_ends_at') THEN
         ALTER TABLE merchants ADD COLUMN trial_ends_at TIMESTAMPTZ;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='incidents' AND column_name='incident_type') THEN
+        ALTER TABLE incidents ADD COLUMN incident_type TEXT NOT NULL DEFAULT 'volume_drop';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='incidents' AND column_name='detail') THEN
+        ALTER TABLE incidents ADD COLUMN detail JSONB;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='merchants' AND column_name='checkout_conversion_baseline') THEN
+        ALTER TABLE merchants ADD COLUMN checkout_conversion_baseline NUMERIC(5,4);
+    END IF;
 END $$;
 
 CREATE TABLE IF NOT EXISTS checkout_events (

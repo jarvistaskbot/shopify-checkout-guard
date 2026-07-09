@@ -8,3 +8,6 @@ venv/
 dist/
 build/
 .pytest_cache/
+.venv312/
+node_modules/
+checkout-guard/node_modules/

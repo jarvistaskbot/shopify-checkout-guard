@@ -55,7 +55,7 @@ async def order_created(
             order_id,
         )
 
-    await process_event(x_shopify_shop_domain)
+    await process_event(x_shopify_shop_domain, "order_created")
     return {"ok": True}
 
 
@@ -80,7 +80,7 @@ async def checkout_created(
             checkout_token,
         )
 
-    await process_event(x_shopify_shop_domain)
+    await process_event(x_shopify_shop_domain, "checkout_created")
     return {"ok": True}
 
 
@@ -105,6 +105,7 @@ async def checkout_deleted(
             checkout_token,
         )
 
+    await process_event(x_shopify_shop_domain, "checkout_deleted")
     return {"ok": True}
 
 

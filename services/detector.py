@@ -1,43 +1,76 @@
 """
-Anomaly detection engine — order volume based.
+Multi-signal anomaly detection engine.
 
-Algorithm:
-  1. On every orders/create webhook, count orders in a 30-min sliding window.
-  2. Fetch 7-day rolling baseline for the same hour-of-day (+-1 h).
-  3. If current_volume < baseline * (1 - threshold/100) for 3+ consecutive
-     triggers -> open an incident.
-  4. Resolve when volume recovers within 10% of baseline for 2 consecutive checks.
+Detectors:
+  1. checkout_funnel   — checkout→order conversion rate collapse (most powerful)
+  2. order_silence     — no orders during expected peak, day-of-week aware
+  3. abandonment_spike — sudden spike in unmatched checkouts
+  4. payment_failure   — orders stuck in pending via Shopify API polling
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import asyncpg
+import httpx
 
 from database import get_pool
 
+logger = logging.getLogger(__name__)
 
 _WINDOW_MINUTES = 30
 _BASELINE_DAYS = 7
+_MIN_BASELINE_VOLUME = 1.0
+
+# Funnel
+_MIN_CHECKOUTS_FOR_FUNNEL = 5
+_FUNNEL_ALERT_THRESHOLD = 0.50  # alert if conversion < 50% of baseline
+
+# Silence
 _CONSECUTIVE_DROPS_REQUIRED = 3
 _RECOVERY_CHECKS_REQUIRED = 2
 
+# Abandonment
+_ABANDONMENT_SPIKE_MULTIPLIER = 3.0
+_MIN_ABANDONMENTS_FOR_SPIKE = 5
 
-async def process_event(shop_domain: str) -> None:
-    """Called after every orders/create insertion. Runs detection in background."""
-    asyncio.create_task(_run_check(shop_domain))
+# Payment
+_PAYMENT_PENDING_MINUTES = 15
+_MIN_PENDING_FOR_ALERT = 3
 
 
-async def _run_check(shop_domain: str) -> None:
+async def process_event(shop_domain: str, event_type: str = "order_created") -> None:
+    asyncio.create_task(_run_realtime_checks(shop_domain, event_type))
+
+
+async def run_proactive_checks_all_merchants() -> None:
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            shops = await conn.fetch(
+                "SELECT shop_domain, access_token FROM merchants WHERE active = TRUE"
+            )
+        for row in shops:
+            asyncio.create_task(
+                _check_payment_failures(row["shop_domain"], row["access_token"])
+            )
+    except Exception as exc:
+        logger.error("Proactive check loop error: %s", exc)
+
+
+async def _run_realtime_checks(shop_domain: str, event_type: str) -> None:
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
                 """
-                SELECT alert_threshold_pct, active, drop_streak, recovery_streak, avg_order_value
+                SELECT alert_threshold_pct, active, drop_streak, recovery_streak,
+                       avg_order_value, slack_webhook_url, checkout_conversion_baseline
                 FROM merchants WHERE shop_domain = $1
                 """,
                 shop_domain,
@@ -45,170 +78,479 @@ async def _run_check(shop_domain: str) -> None:
             if not merchant or not merchant["active"]:
                 return
 
-            threshold_pct = merchant["alert_threshold_pct"]
-            drop_streak = merchant["drop_streak"]
-            recovery_streak = merchant["recovery_streak"]
-            avg_order_value = float(merchant["avg_order_value"])
             now = datetime.now(timezone.utc)
-
-            current_volume = await _current_volume(conn, shop_domain, now)
-            baseline_volume = await _baseline_volume(conn, shop_domain, now)
-
-            if baseline_volume is None or baseline_volume == 0:
-                return
-
-            drop_pct = (baseline_volume - current_volume) / baseline_volume * 100
-            is_dropping = drop_pct >= threshold_pct
-
-            if is_dropping:
-                drop_streak += 1
-                recovery_streak = 0
-            else:
-                recovery_streak += 1
-                drop_streak = 0
-
-            await conn.execute(
-                "UPDATE merchants SET drop_streak = $1, recovery_streak = $2 WHERE shop_domain = $3",
-                drop_streak,
-                recovery_streak,
-                shop_domain,
-            )
-
-            active_incident = await conn.fetchrow(
-                "SELECT id, started_at FROM incidents WHERE shop_domain = $1 AND resolved_at IS NULL",
-                shop_domain,
-            )
-
-            if not active_incident:
-                if drop_streak >= _CONSECUTIVE_DROPS_REQUIRED:
-                    rev_loss_per_min = _revenue_loss_per_minute(
-                        baseline_volume, current_volume, avg_order_value
-                    )
-                    incident_id = await conn.fetchval(
-                        """
-                        INSERT INTO incidents
-                            (shop_domain, checkout_rate_before, checkout_rate_during,
-                             estimated_revenue_loss_per_min, avg_order_value, notified)
-                        VALUES ($1, $2, $3, $4, $5, FALSE)
-                        RETURNING id
-                        """,
-                        shop_domain,
-                        float(baseline_volume),
-                        float(current_volume),
-                        rev_loss_per_min,
-                        avg_order_value,
-                    )
-                    await _notify(conn, shop_domain, incident_id, baseline_volume, current_volume, rev_loss_per_min)
-            else:
-                recovery_threshold = baseline_volume * 0.9
-                if current_volume >= recovery_threshold and recovery_streak >= _RECOVERY_CHECKS_REQUIRED:
-                    await conn.execute(
-                        "UPDATE incidents SET resolved_at = $1 WHERE id = $2",
-                        now,
-                        active_incident["id"],
-                    )
-                    await conn.execute(
-                        "UPDATE merchants SET drop_streak = 0, recovery_streak = 0 WHERE shop_domain = $1",
-                        shop_domain,
-                    )
-                    slack_row = await conn.fetchrow(
-                        "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
-                        shop_domain,
-                    )
-                    if slack_row and slack_row["slack_webhook_url"]:
-                        from services.alerter import send_recovery_alert
-                        duration_minutes = int(
-                            (now - active_incident["started_at"]).total_seconds() / 60
-                        )
-                        await send_recovery_alert(
-                            webhook_url=slack_row["slack_webhook_url"],
-                            shop_domain=shop_domain,
-                            incident_id=active_incident["id"],
-                            duration_minutes=duration_minutes,
-                        )
+            await _check_checkout_funnel(conn, shop_domain, merchant, now)
+            await _check_order_silence(conn, shop_domain, merchant, now)
+            if event_type in ("checkout_created", "checkout_deleted"):
+                await _check_abandonment_spike(conn, shop_domain, merchant, now)
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).error("Detection error for %s: %s", shop_domain, exc)
+        logger.error("Realtime detection error for %s: %s", shop_domain, exc)
 
 
-async def _current_volume(
-    conn: asyncpg.Connection, shop_domain: str, now: datetime
-) -> int:
-    """Orders received in the last 30 minutes."""
-    since = now - timedelta(minutes=_WINDOW_MINUTES)
-    return await conn.fetchval(
+# ---------------------------------------------------------------------------
+# Detector 1: Checkout funnel collapse
+# ---------------------------------------------------------------------------
+
+async def _check_checkout_funnel(
+    conn: asyncpg.Connection,
+    shop_domain: str,
+    merchant: asyncpg.Record,
+    now: datetime,
+) -> None:
+    window_start = now - timedelta(minutes=_WINDOW_MINUTES)
+
+    checkouts = await conn.fetchval(
         """
         SELECT COUNT(*) FROM checkout_events
-        WHERE shop_domain = $1
-          AND event_type = 'order_created'
-          AND created_at >= $2
+        WHERE shop_domain = $1 AND event_type = 'checkout_created' AND created_at >= $2
         """,
-        shop_domain,
-        since,
+        shop_domain, window_start,
     ) or 0
 
+    if checkouts < _MIN_CHECKOUTS_FOR_FUNNEL:
+        return
 
-async def _baseline_volume(
+    orders = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain = $1 AND event_type = 'order_created' AND created_at >= $2
+        """,
+        shop_domain, window_start,
+    ) or 0
+
+    current_rate = orders / checkouts
+
+    baseline_rate = merchant["checkout_conversion_baseline"]
+    if not baseline_rate:
+        baseline_rate = await _compute_conversion_baseline(conn, shop_domain, now)
+        if baseline_rate:
+            await conn.execute(
+                "UPDATE merchants SET checkout_conversion_baseline = $1 WHERE shop_domain = $2",
+                baseline_rate, shop_domain,
+            )
+
+    if not baseline_rate or float(baseline_rate) < 0.05:
+        return
+
+    is_broken = current_rate < float(baseline_rate) * _FUNNEL_ALERT_THRESHOLD
+
+    active = await _get_active_incident(conn, shop_domain, "checkout_funnel_collapse")
+
+    if not active and is_broken:
+        aov = float(merchant["avg_order_value"])
+        missed_orders = max(0, int(checkouts * float(baseline_rate)) - orders)
+        revenue_at_risk = round(missed_orders * aov, 2)
+
+        incident_id = await conn.fetchval(
+            """
+            INSERT INTO incidents
+                (shop_domain, checkout_rate_before, checkout_rate_during,
+                 estimated_revenue_loss_per_min, avg_order_value, notified,
+                 incident_type, detail)
+            VALUES ($1, $2, $3, $4, $5, FALSE, 'checkout_funnel_collapse', $6::jsonb)
+            RETURNING id
+            """,
+            shop_domain,
+            float(baseline_rate),
+            current_rate,
+            round(revenue_at_risk / _WINDOW_MINUTES, 2),
+            aov,
+            json.dumps({
+                "checkouts": checkouts,
+                "orders": orders,
+                "current_rate": round(current_rate, 4),
+                "baseline_rate": round(float(baseline_rate), 4),
+            }),
+        )
+        if merchant["slack_webhook_url"]:
+            try:
+                from services.alerter import send_checkout_funnel_alert
+                await send_checkout_funnel_alert(
+                    webhook_url=merchant["slack_webhook_url"],
+                    shop_domain=shop_domain,
+                    incident_id=incident_id,
+                    checkouts=checkouts,
+                    orders=orders,
+                    current_rate=current_rate,
+                    baseline_rate=float(baseline_rate),
+                    aov=aov,
+                )
+                await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
+            except Exception as exc:
+                logger.error("Funnel alert failed: %s", exc)
+
+    elif active and not is_broken:
+        await _resolve_incident(conn, shop_domain, active, now, merchant)
+
+
+async def _compute_conversion_baseline(
     conn: asyncpg.Connection, shop_domain: str, now: datetime
 ) -> Optional[float]:
-    """Average 30-min order count for this hour-of-day over the last 7 days."""
-    hour = now.hour
     since = now - timedelta(days=_BASELINE_DAYS)
+    checkouts = await conn.fetchval(
+        "SELECT COUNT(*) FROM checkout_events WHERE shop_domain=$1 AND event_type='checkout_created' AND created_at>=$2",
+        shop_domain, since,
+    ) or 0
+    orders = await conn.fetchval(
+        "SELECT COUNT(*) FROM checkout_events WHERE shop_domain=$1 AND event_type='order_created' AND created_at>=$2",
+        shop_domain, since,
+    ) or 0
+    if checkouts < 10:
+        return None
+    return orders / checkouts
 
+
+# ---------------------------------------------------------------------------
+# Detector 2: Order silence (day-of-week aware)
+# ---------------------------------------------------------------------------
+
+async def _check_order_silence(
+    conn: asyncpg.Connection,
+    shop_domain: str,
+    merchant: asyncpg.Record,
+    now: datetime,
+) -> None:
+    window_start = now - timedelta(minutes=_WINDOW_MINUTES)
+    current_volume = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain = $1 AND event_type = 'order_created' AND created_at >= $2
+        """,
+        shop_domain, window_start,
+    ) or 0
+
+    baseline = await _compute_silence_baseline(conn, shop_domain, now)
+    if baseline is None or baseline < _MIN_BASELINE_VOLUME:
+        return
+
+    threshold_pct = merchant["alert_threshold_pct"]
+    drop_pct = (baseline - current_volume) / baseline * 100
+    is_dropping = drop_pct >= threshold_pct
+
+    drop_streak = merchant["drop_streak"]
+    recovery_streak = merchant["recovery_streak"]
+
+    if is_dropping:
+        drop_streak += 1
+        recovery_streak = 0
+    else:
+        recovery_streak += 1
+        drop_streak = 0
+
+    await conn.execute(
+        "UPDATE merchants SET drop_streak=$1, recovery_streak=$2 WHERE shop_domain=$3",
+        drop_streak, recovery_streak, shop_domain,
+    )
+
+    active = await _get_active_incident(conn, shop_domain, "volume_drop")
+
+    if not active and drop_streak >= _CONSECUTIVE_DROPS_REQUIRED:
+        aov = float(merchant["avg_order_value"])
+        rev_loss_per_min = round(max(0.0, baseline - current_volume) / _WINDOW_MINUTES * aov, 2)
+
+        incident_id = await conn.fetchval(
+            """
+            INSERT INTO incidents
+                (shop_domain, checkout_rate_before, checkout_rate_during,
+                 estimated_revenue_loss_per_min, avg_order_value, notified,
+                 incident_type, detail)
+            VALUES ($1, $2, $3, $4, $5, FALSE, 'volume_drop', $6::jsonb)
+            RETURNING id
+            """,
+            shop_domain,
+            float(baseline), float(current_volume),
+            rev_loss_per_min, aov,
+            json.dumps({"drop_pct": round(drop_pct, 1), "baseline": round(float(baseline), 2)}),
+        )
+        if merchant["slack_webhook_url"]:
+            try:
+                from services.alerter import send_silence_alert
+                await send_silence_alert(
+                    webhook_url=merchant["slack_webhook_url"],
+                    shop_domain=shop_domain,
+                    incident_id=incident_id,
+                    baseline=baseline,
+                    current_volume=current_volume,
+                    aov=aov,
+                )
+                await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
+            except Exception as exc:
+                logger.error("Silence alert failed: %s", exc)
+
+    elif active and recovery_streak >= _RECOVERY_CHECKS_REQUIRED:
+        await conn.execute(
+            "UPDATE merchants SET drop_streak=0, recovery_streak=0 WHERE shop_domain=$1",
+            shop_domain,
+        )
+        await _resolve_incident(conn, shop_domain, active, now, merchant)
+
+
+async def _compute_silence_baseline(
+    conn: asyncpg.Connection, shop_domain: str, now: datetime
+) -> Optional[float]:
+    weekday = now.weekday()
+    hour = now.hour
+    since = now - timedelta(days=28)
+
+    # Same weekday + hour, last 4 weeks
     total = await conn.fetchval(
         """
         SELECT COUNT(*) FROM checkout_events
-        WHERE shop_domain = $1
-          AND event_type = 'order_created'
+        WHERE shop_domain=$1 AND event_type='order_created' AND created_at>=$2
+          AND EXTRACT(DOW FROM created_at AT TIME ZONE 'UTC')=$3
+          AND EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC') BETWEEN $4 AND $5
+        """,
+        shop_domain, since, weekday,
+        max(0, hour - 1), min(23, hour + 1),
+    ) or 0
+
+    if total > 0:
+        return total / (4 * 6)  # 4 weeks x 6 half-hour slots in 3h window
+
+    # Fallback: any day, same hour, last 7 days
+    total = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='order_created'
           AND created_at >= $2
           AND EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC') BETWEEN $3 AND $4
         """,
-        shop_domain,
-        since,
-        max(0, hour - 1),
-        min(23, hour + 1),
+        shop_domain, now - timedelta(days=_BASELINE_DAYS),
+        max(0, hour - 1), min(23, hour + 1),
     ) or 0
 
     if total == 0:
         return None
-
-    # 30-min slots in a 3-hour window over 7 days = 7 * 6 = 42
-    slots = _BASELINE_DAYS * 6
-    return total / slots
+    return total / (_BASELINE_DAYS * 6)
 
 
-def _revenue_loss_per_minute(
-    baseline_volume: float,
-    current_volume: int,
-    avg_order_value: float,
-) -> float:
-    lost_orders = max(0.0, baseline_volume - current_volume)
-    lost_orders_per_minute = lost_orders / _WINDOW_MINUTES
-    return round(lost_orders_per_minute * avg_order_value, 2)
+# ---------------------------------------------------------------------------
+# Detector 3: Abandonment spike
+# ---------------------------------------------------------------------------
 
-
-async def _notify(
+async def _check_abandonment_spike(
     conn: asyncpg.Connection,
     shop_domain: str,
-    incident_id: int,
-    baseline_volume: float,
-    current_volume: int,
-    rev_loss_per_min: float,
+    merchant: asyncpg.Record,
+    now: datetime,
 ) -> None:
-    from services.alerter import send_alert
+    # Checkouts created 35-65 min ago with no matching order (give webhook time to arrive)
+    abandoned = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT ce.checkout_token) FROM checkout_events ce
+        WHERE ce.shop_domain=$1 AND ce.event_type='checkout_created'
+          AND ce.created_at BETWEEN $2 AND $3
+          AND ce.checkout_token IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM checkout_events ord
+              WHERE ord.shop_domain=$1 AND ord.event_type='order_created'
+                AND ord.checkout_token = ce.checkout_token
+          )
+        """,
+        shop_domain,
+        now - timedelta(minutes=65),
+        now - timedelta(minutes=35),
+    ) or 0
 
-    merchant = await conn.fetchrow(
-        "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1", shop_domain
+    if abandoned < _MIN_ABANDONMENTS_FOR_SPIKE:
+        return
+
+    checkouts_same_window = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='checkout_created'
+          AND created_at BETWEEN $2 AND $3
+        """,
+        shop_domain,
+        now - timedelta(minutes=65),
+        now - timedelta(minutes=35),
+    ) or 0
+
+    current_abandon_rate = abandoned / max(1, checkouts_same_window)
+
+    # Baseline: 7-day average abandonment rate at this hour
+    since = now - timedelta(days=_BASELINE_DAYS)
+    bl_checkouts = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='checkout_created' AND created_at BETWEEN $2 AND $3
+        """,
+        shop_domain, since, now - timedelta(minutes=35),
+    ) or 0
+    bl_orders = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT checkout_token) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='order_created'
+          AND created_at >= $2 AND checkout_token IS NOT NULL
+        """,
+        shop_domain, since,
+    ) or 0
+
+    if bl_checkouts == 0:
+        return
+
+    baseline_abandon_rate = max(0.0, (bl_checkouts - bl_orders) / bl_checkouts)
+    is_spike = (
+        current_abandon_rate > baseline_abandon_rate * _ABANDONMENT_SPIKE_MULTIPLIER
+        and current_abandon_rate > 0.60
     )
-    if merchant and merchant["slack_webhook_url"]:
-        await send_alert(
-            webhook_url=merchant["slack_webhook_url"],
-            shop_domain=shop_domain,
-            incident_id=incident_id,
-            baseline_rate=baseline_volume,
-            current_rate=float(current_volume),
-            rev_loss_per_min=rev_loss_per_min,
+
+    active = await _get_active_incident(conn, shop_domain, "abandonment_spike")
+
+    if not active and is_spike:
+        aov = float(merchant["avg_order_value"])
+        incident_id = await conn.fetchval(
+            """
+            INSERT INTO incidents
+                (shop_domain, checkout_rate_before, checkout_rate_during,
+                 estimated_revenue_loss_per_min, avg_order_value, notified,
+                 incident_type, detail)
+            VALUES ($1, $2, $3, 0, $4, FALSE, 'abandonment_spike', $5::jsonb)
+            RETURNING id
+            """,
+            shop_domain,
+            baseline_abandon_rate, current_abandon_rate, aov,
+            json.dumps({
+                "abandoned": abandoned,
+                "checkouts": checkouts_same_window,
+                "current_rate": round(current_abandon_rate, 4),
+                "baseline_rate": round(baseline_abandon_rate, 4),
+            }),
         )
-        await conn.execute(
-            "UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id
-        )
+        if merchant["slack_webhook_url"]:
+            try:
+                from services.alerter import send_abandonment_alert
+                await send_abandonment_alert(
+                    webhook_url=merchant["slack_webhook_url"],
+                    shop_domain=shop_domain,
+                    incident_id=incident_id,
+                    abandoned=abandoned,
+                    checkouts=checkouts_same_window,
+                    current_rate=current_abandon_rate,
+                    baseline_rate=baseline_abandon_rate,
+                    aov=aov,
+                )
+                await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
+            except Exception as exc:
+                logger.error("Abandonment alert failed: %s", exc)
+
+    elif active and not is_spike:
+        await _resolve_incident(conn, shop_domain, active, now, merchant)
+
+
+# ---------------------------------------------------------------------------
+# Detector 4: Payment failures (API polling)
+# ---------------------------------------------------------------------------
+
+async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            merchant = await conn.fetchrow(
+                "SELECT slack_webhook_url, active FROM merchants WHERE shop_domain=$1",
+                shop_domain,
+            )
+            if not merchant or not merchant["active"]:
+                return
+
+            active = await _get_active_incident(conn, shop_domain, "payment_failure")
+            if active:
+                return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=_PAYMENT_PENDING_MINUTES)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://{shop_domain}/admin/api/2024-10/orders.json",
+                headers={"X-Shopify-Access-Token": access_token},
+                params={
+                    "financial_status": "pending",
+                    "status": "open",
+                    "created_at_max": cutoff.isoformat(),
+                    "fields": "id,name,total_price,created_at",
+                    "limit": 50,
+                },
+            )
+            if resp.status_code != 200:
+                return
+            orders = resp.json().get("orders", [])
+
+        if len(orders) < _MIN_PENDING_FOR_ALERT:
+            return
+
+        order_names = [o["name"] for o in orders[:5]]
+        total_at_risk = round(sum(float(o.get("total_price", 0)) for o in orders), 2)
+
+        async with pool.acquire() as conn:
+            incident_id = await conn.fetchval(
+                """
+                INSERT INTO incidents
+                    (shop_domain, checkout_rate_before, checkout_rate_during,
+                     estimated_revenue_loss_per_min, avg_order_value, notified,
+                     incident_type, detail)
+                VALUES ($1, 0, 0, 0, 0, FALSE, 'payment_failure', $2::jsonb)
+                RETURNING id
+                """,
+                shop_domain,
+                json.dumps({"pending_count": len(orders), "total_at_risk": total_at_risk, "order_names": order_names}),
+            )
+            if merchant["slack_webhook_url"]:
+                try:
+                    from services.alerter import send_payment_failure_alert
+                    await send_payment_failure_alert(
+                        webhook_url=merchant["slack_webhook_url"],
+                        shop_domain=shop_domain,
+                        incident_id=incident_id,
+                        pending_count=len(orders),
+                        order_names=order_names,
+                        total_at_risk=total_at_risk,
+                    )
+                    await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
+                except Exception as exc:
+                    logger.error("Payment failure alert failed: %s", exc)
+    except Exception as exc:
+        logger.error("Payment failure check error for %s: %s", shop_domain, exc)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _get_active_incident(
+    conn: asyncpg.Connection, shop_domain: str, incident_type: str
+) -> Optional[asyncpg.Record]:
+    return await conn.fetchrow(
+        """
+        SELECT id, started_at FROM incidents
+        WHERE shop_domain=$1 AND incident_type=$2 AND resolved_at IS NULL
+        ORDER BY started_at DESC LIMIT 1
+        """,
+        shop_domain, incident_type,
+    )
+
+
+async def _resolve_incident(
+    conn: asyncpg.Connection,
+    shop_domain: str,
+    active: asyncpg.Record,
+    now: datetime,
+    merchant: asyncpg.Record,
+) -> None:
+    await conn.execute(
+        "UPDATE incidents SET resolved_at=$1 WHERE id=$2", now, active["id"]
+    )
+    if merchant["slack_webhook_url"]:
+        try:
+            from services.alerter import send_recovery_alert
+            duration_minutes = int((now - active["started_at"]).total_seconds() / 60)
+            incident_type = await conn.fetchval(
+                "SELECT incident_type FROM incidents WHERE id=$1", active["id"]
+            )
+            await send_recovery_alert(
+                webhook_url=merchant["slack_webhook_url"],
+                shop_domain=shop_domain,
+                incident_id=active["id"],
+                duration_minutes=duration_minutes,
+                incident_type=incident_type or "unknown",
+            )
+        except Exception as exc:
+            logger.error("Recovery alert failed: %s", exc)
