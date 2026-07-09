@@ -49,14 +49,19 @@ async def _token_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for attempt in range(10):
-        try:
-            await create_pool(settings.database_url)
-            break
-        except Exception:
-            if attempt == 9:
-                raise
-            await asyncio.sleep(3)
+    if settings.database_url:
+        for attempt in range(10):
+            try:
+                await create_pool(settings.database_url)
+                logger.info("Database pool created")
+                break
+            except Exception as exc:
+                if attempt == 9:
+                    logger.error("Database unavailable after 10 attempts: %s", exc)
+                    break
+                await asyncio.sleep(3)
+    else:
+        logger.warning("DATABASE_URL not set — skipping DB pool creation")
     task = asyncio.create_task(_token_refresh_loop())
     task2 = asyncio.create_task(_proactive_monitor_loop())
     yield
