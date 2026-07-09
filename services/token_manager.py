@@ -94,7 +94,8 @@ async def exchange_to_expiring(
             "client_secret": api_secret,
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "subject_token": old_token,
-            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "subject_token_type": "urn:shopify:params:oauth:token-type:offline-access-token",
+            "requested_token_type": "urn:shopify:params:oauth:token-type:offline-access-token",
             "expiring": 1,
         },
     )
@@ -105,7 +106,8 @@ async def _call_token_endpoint(shop: str, payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"https://{shop}/admin/oauth/access_token",
-            json=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            data={k: str(v) for k, v in payload.items()},
         )
         resp.raise_for_status()
         return resp.json()
