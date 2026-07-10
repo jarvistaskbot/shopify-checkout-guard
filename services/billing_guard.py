@@ -12,9 +12,17 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from services.plans import PLANS, get_ai_cap
+
 logger = logging.getLogger(__name__)
 
 _ACTIVE_STATUSES = frozenset({"active", "pending"})
+
+
+def plan_allows(merchant_plan: Optional[str], feature: str) -> bool:
+    """Return True if the merchant's plan permits the requested feature."""
+    p = PLANS.get(merchant_plan or "starter", PLANS["starter"])
+    return bool(p.get(feature, False))
 
 
 def alerts_allowed(billing_status: Optional[str]) -> bool:
@@ -43,7 +51,7 @@ def get_billing_banner(
             return (
                 "banner-trial",
                 f"Trial &mdash; {days_left} {label} left. "
-                f"<a href='/billing/start?shop={safe_shop}'>Manage subscription</a>",
+                f"<a href='/billing/plans?shop={safe_shop}'>Manage subscription</a>",
             )
         return None
 
@@ -56,7 +64,7 @@ def get_billing_banner(
 
     return (
         "banner-subscribe",
-        f"{msg} <a href='/billing/start?shop={safe_shop}'>Start your 14-day free trial</a> "
+        f"{msg} <a href='/billing/plans?shop={safe_shop}'>Start your 14-day free trial</a> "
         f"to activate CheckoutGuard alerts.",
     )
 

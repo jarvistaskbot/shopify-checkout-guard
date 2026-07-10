@@ -138,7 +138,7 @@ async def onboarding_save(
             alert_email or None,
             shop,
         )
-    return RedirectResponse(url=f"/billing/start?shop={escape(shop)}", status_code=303)
+    return RedirectResponse(url=f"/billing/plans?shop={escape(shop)}", status_code=303)
 
 
 @router.get("/demo", response_class=HTMLResponse)

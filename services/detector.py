@@ -67,6 +67,22 @@ async def run_proactive_checks_all_merchants() -> None:
         logger.error("Proactive check loop error: %s", exc)
 
 
+async def run_proactive_checks_fast_merchants() -> None:
+    """Run proactive checks for pro/scale merchants only (1-min fast-check path)."""
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            shops = await conn.fetch(
+                "SELECT shop_domain, access_token FROM merchants WHERE active = TRUE AND plan IN ('pro', 'scale')"
+            )
+        for row in shops:
+            asyncio.create_task(
+                _check_payment_failures(row["shop_domain"], row["access_token"])
+            )
+    except Exception as exc:
+        logger.error("Fast proactive check loop error: %s", exc)
+
+
 async def _run_realtime_checks(shop_domain: str, event_type: str) -> None:
     pool = await get_pool()
     try:
@@ -75,7 +91,7 @@ async def _run_realtime_checks(shop_domain: str, event_type: str) -> None:
                 """
                 SELECT alert_threshold_pct, active, drop_streak, recovery_streak,
                        avg_order_value, slack_webhook_url, checkout_conversion_baseline,
-                       alert_email, billing_status
+                       alert_email, billing_status, plan, threshold_override
                 FROM merchants WHERE shop_domain = $1
                 """,
                 shop_domain,
@@ -236,7 +252,19 @@ async def _check_order_silence(
     if baseline is None or baseline < _MIN_BASELINE_VOLUME:
         return
 
+    # Scale tier: apply per-merchant threshold override if set.
+    from services.billing_guard import plan_allows
     threshold_pct = merchant["alert_threshold_pct"]
+    if plan_allows(merchant.get("plan"), "custom_thresholds"):
+        override = merchant.get("threshold_override") or {}
+        if isinstance(override, str):
+            try:
+                import json as _json
+                override = _json.loads(override)
+            except Exception:
+                override = {}
+        if override.get("alert_threshold_pct"):
+            threshold_pct = int(override["alert_threshold_pct"])
     drop_pct = (baseline - current_volume) / baseline * 100
     is_dropping = drop_pct >= threshold_pct
 
@@ -587,10 +615,15 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, alert_email, active, billing_status FROM merchants WHERE shop_domain = $1",
+                "SELECT slack_webhook_url, alert_email, active, billing_status, plan FROM merchants WHERE shop_domain = $1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
+                return
+
+            # JS error monitoring is a growth+ feature.
+            from services.billing_guard import plan_allows as _pa
+            if not _pa(merchant.get("plan"), "js_errors"):
                 return
 
             now = datetime.now(timezone.utc)
@@ -766,10 +799,15 @@ async def check_oos_hot_product(
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, alert_email, avg_order_value, active, billing_status FROM merchants WHERE shop_domain = $1",
+                "SELECT slack_webhook_url, alert_email, avg_order_value, active, billing_status, plan FROM merchants WHERE shop_domain = $1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
+                return
+
+            # OOS monitoring is a pro+ feature.
+            from services.billing_guard import plan_allows as _pa2
+            if not _pa2(merchant.get("plan"), "oos"):
                 return
 
             product_id = await conn.fetchval(
@@ -961,9 +999,18 @@ async def _get_ai_analysis(incident_type: str, detail: dict, shop_domain: str) -
     try:
         from config import settings
         from services.ai_analyst import analyze_incident
-        from services.billing_guard import consume_ai_budget
+        from services.billing_guard import consume_ai_budget, plan_allows
+        from services.plans import get_ai_cap
         pool = await get_pool()
-        if not await consume_ai_budget(pool, shop_domain, settings.ai_monthly_call_cap):
+        # Fetch merchant plan to gate AI and use per-plan cap.
+        async with pool.acquire() as conn:
+            merchant_plan = await conn.fetchval(
+                "SELECT plan FROM merchants WHERE shop_domain=$1", shop_domain
+            ) or "starter"
+        if not plan_allows(merchant_plan, "ai_analysis"):
+            return None
+        cap = get_ai_cap(merchant_plan)
+        if not await consume_ai_budget(pool, shop_domain, cap):
             return None
         return await analyze_incident(
             incident_type=incident_type,

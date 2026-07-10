@@ -13,7 +13,7 @@ from routes.dashboard import router as dashboard_router
 from routes.events import router as events_router
 from routes.onboarding import router as onboarding_router
 from routes.webhooks import router as webhook_router
-from services.detector import run_proactive_checks_all_merchants
+from services.detector import run_proactive_checks_all_merchants, run_proactive_checks_fast_merchants
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,22 @@ async def _proactive_monitor_loop() -> None:
                     "Proactive monitor has failed %d times in a row — possible DB outage",
                     consecutive_errors,
                 )
+
+
+async def _fast_proactive_monitor_loop() -> None:
+    """Run payment failure checks every 1 minute for pro/scale merchants (fast_checks feature)."""
+    consecutive_errors = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await run_proactive_checks_fast_merchants()
+            consecutive_errors = 0
+        except Exception as exc:
+            consecutive_errors += 1
+            logger.error(
+                "Fast proactive monitor loop error (%d consecutive): %s",
+                consecutive_errors, exc,
+            )
 
 
 async def _token_refresh_loop() -> None:
@@ -125,6 +141,7 @@ async def _send_pending_digests() -> None:
                FROM merchants
                WHERE active = TRUE AND alert_email IS NOT NULL
                  AND billing_status IN ('active', 'pending')
+                 AND plan IN ('growth', 'pro', 'scale')
                  AND installed_at <= NOW() - INTERVAL '7 days'
                  AND (last_digest_sent_at IS NULL OR last_digest_sent_at < NOW() - INTERVAL '7 days')"""
         )
@@ -244,6 +261,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_token_refresh_loop()),
         asyncio.create_task(_proactive_monitor_loop()),
+        asyncio.create_task(_fast_proactive_monitor_loop()),
         asyncio.create_task(_data_retention_loop()),
         asyncio.create_task(_weekly_digest_loop()),
     ]

@@ -42,6 +42,7 @@ CheckoutGuard is a Shopify app that detects silent revenue bleed by monitoring r
 │  ├─ GET  /onboarding            Slack config form                │
 │  ├─ POST /onboarding            Save Slack config                │
 │  ├─ GET  /dashboard             Server-rendered incidents page   │
+│  ├─ GET  /billing/plans         Plan selection page (4 tiers)    │
 │  ├─ GET  /billing/start         Create Shopify charge            │
 │  ├─ GET  /billing/callback      Activate charge                  │
 │  ├─ GET  /demo                  App Store review demo page       │
@@ -200,7 +201,7 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 | Data retention | ✅ v2 built | Hourly loop purges events >90d, line items >7d, nonces >15min |
 | AI incident analysis (Haiku) | ✅ v2 built | claude-haiku-4-5-20251001, fail-silent, 600-char diagnosis; 200/mo per-merchant cap |
 | Weekly digest email | ✅ v2 built | 7-day stats + optional Haiku summary; hourly check |
-| Multi-plan billing tiers | ❌ planned | Only one plan ($29) exists |
+| Multi-plan billing tiers | ✅ v2 built | 4 tiers: starter $29/growth $79/pro $199/scale $399; plan selection page at /billing/plans |
 | Agency / multi-store view | ❌ planned | Not started |
 | Embedded App Bridge UI | ❌ never built | embedded=false in toml; dashboard is external page |
 | React/Polaris dashboard | ❌ never built | Spec said React; implementation is server-rendered HTML |

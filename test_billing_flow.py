@@ -95,7 +95,7 @@ def test_billing_banner_inactive() -> None:
     if banner:
         cls, text = banner
         result("CSS class is banner-subscribe", cls == "banner-subscribe", cls)
-        result("Contains billing/start link", "/billing/start" in text)
+        result("Contains billing/plans link", "/billing/plans" in text)
 
 
 def test_billing_banner_trial() -> None:
@@ -219,7 +219,7 @@ async def test_dashboard_subscribe_banner(client: httpx.AsyncClient, conn) -> No
     )
     result("Dashboard 200", r.status_code == 200)
     result("Subscribe banner present", "banner-subscribe" in r.text or "Start your 14-day free trial" in r.text)
-    result("Billing/start link present", "/billing/start" in r.text)
+    result("Billing/plans link present", "/billing/plans" in r.text)
 
 
 async def test_dashboard_trial_banner(client: httpx.AsyncClient, conn) -> None:

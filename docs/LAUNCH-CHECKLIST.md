@@ -8,7 +8,11 @@ Steps are in dependency order. Do not skip or reorder.
 ## Phase 1 — Pre-Deploy (before any VPS changes)
 
 ### 1. Verify Shopify Partner Dashboard listing
-- [ ] **Pricing section** shows "$29/month" recurring + "14-day free trial" — Arto must verify manually in Partners > Apps > CheckoutGuard > Pricing
+- [ ] **Pricing section** must have ALL FOUR plans entered in Partners > Apps > CheckoutGuard > Pricing:
+  - CheckoutGuard Starter — $29.00/month recurring, 14-day free trial
+  - CheckoutGuard Growth  — $79.00/month recurring, 14-day free trial
+  - CheckoutGuard Pro     — $199.00/month recurring, 14-day free trial
+  - CheckoutGuard Scale   — $399.00/month recurring, 14-day free trial
 - [ ] Support email set to `artomnats1996@gmail.com` in Partners Dashboard
 - [ ] App listing "Make fully visible" decision: set to public if ready for organic discovery, or leave as "unlisted/invite-only" for initial controlled launch
 - [ ] Privacy policy URL points to `https://checkoutguardalerts.com/privacy`

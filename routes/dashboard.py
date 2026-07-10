@@ -121,7 +121,7 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
     async with pool.acquire() as conn:
         merchant = await conn.fetchrow(
             """SELECT shop_domain, installed_at, slack_webhook_url, alert_email,
-                      billing_status, trial_ends_at
+                      billing_status, trial_ends_at, plan
                FROM merchants WHERE shop_domain = $1 AND active = TRUE""",
             shop,
         )
@@ -168,11 +168,14 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         slack_masked = "..." + merchant["slack_webhook_url"][-6:]
 
     from services.billing_guard import get_billing_banner
+    from services.plans import PLANS
     billing_banner = get_billing_banner(
         merchant["billing_status"],
         merchant["trial_ends_at"],
         shop,
     )
+    merchant_plan = merchant["plan"] or "starter"
+    plan_name = PLANS.get(merchant_plan, PLANS["starter"])["name"]
 
     return HTMLResponse(content=_render(
         shop=shop,
@@ -185,6 +188,7 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         slack_masked=slack_masked,
         alert_email=merchant["alert_email"],
         billing_banner=billing_banner,
+        plan_name=plan_name,
     ))
 
 
@@ -199,6 +203,7 @@ def _render(
     slack_masked=None,
     alert_email=None,
     billing_banner=None,
+    plan_name: str = "CheckoutGuard Starter",
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -302,6 +307,7 @@ def _render(
         b_cls, b_text = billing_banner
         billing_banner_html = f'<div class="banner {b_cls}">{b_text}</div>'
 
+    safe_plan = escape(plan_name)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -311,7 +317,9 @@ def _render(
 </head>
 <body>
   <h1>CheckoutGuard Dashboard</h1>
-  <p class="sub">Monitoring <span class="shop">{safe_shop}</span></p>
+  <p class="sub">Monitoring <span class="shop">{safe_shop}</span>
+    &bull; Plan: <strong>{safe_plan}</strong>
+    &bull; <a href="/billing/plans?shop={safe_shop}">Upgrade</a></p>
   <div class="banner {banner_cls}">{banner_text}</div>
   {billing_banner_html}
   {stats_html}

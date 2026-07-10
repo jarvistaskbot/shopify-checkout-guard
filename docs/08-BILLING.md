@@ -47,15 +47,20 @@ shop/redact (48h later) → all merchant data deleted
 
 ---
 
-## 3. Current Plan
+## 3. Pricing Tiers (v2)
 
-```python
-_PLAN_NAME = "CheckoutGuard Pro"
-_PLAN_PRICE = 29.0
-_TRIAL_DAYS = 14
-```
+Four plans defined in `services/plans.py` — single source of truth for billing and feature gating.
 
-One plan exists. `BILLING_TEST_MODE` env var (default `False`) controls whether charges are Shopify test charges.
+| Plan key | Name | Price | Trial | JS Errors | AI | Weekly Digest | OOS | Fast Checks (1min) | AI Cap | Custom Thresholds |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `starter` | CheckoutGuard Starter | $29/mo | 14d | — | — | — | — | — | 200/mo | — |
+| `growth`  | CheckoutGuard Growth  | $79/mo | 14d | ✓ | ✓ | ✓ | — | — | 200/mo | — |
+| `pro`     | CheckoutGuard Pro     | $199/mo | 14d | ✓ | ✓ | ✓ | ✓ | ✓ | 200/mo | — |
+| `scale`   | CheckoutGuard Scale   | $399/mo | 14d | ✓ | ✓ | ✓ | ✓ | ✓ | 1000/mo | ✓ |
+
+All plans include: checkout-drop alerts, payment-failure alerts, Slack + email, dashboard.
+
+`BILLING_TEST_MODE` env var (default `False`) controls whether charges are Shopify test charges.
 
 ---
 

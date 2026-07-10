@@ -486,10 +486,14 @@ async def main() -> None:
         await test_events_persisted(conn, client)
 
     # Direct detector tests (no HTTP, faster)
+    # JS error spike requires growth+ plan.
+    await conn.execute("UPDATE merchants SET plan='growth' WHERE shop_domain=$1", SHOP)
     await clean_v2_data(conn)
     await test_js_spike_creates_incident(conn)
     await test_js_spike_known_baseline_skipped(conn)
 
+    # OOS detection requires pro+ plan.
+    await conn.execute("UPDATE merchants SET plan='pro' WHERE shop_domain=$1", SHOP)
     await clean_v2_data(conn)
     await test_oos_hot_product_incident(conn)
 
@@ -498,6 +502,9 @@ async def main() -> None:
 
     await clean_v2_data(conn)
     await test_oos_resolves_on_restock(conn)
+
+    # Restore starter plan for subsequent tests.
+    await conn.execute("UPDATE merchants SET plan='starter' WHERE shop_domain=$1", SHOP)
 
     async with httpx.AsyncClient(timeout=10) as client:
         await test_order_line_items_persistence(conn, client)
