@@ -6,6 +6,8 @@ Detectors:
   2. order_silence     — no orders during expected peak, day-of-week aware
   3. abandonment_spike — sudden spike in unmatched checkouts
   4. payment_failure   — orders stuck in pending via Shopify API polling
+  5. js_error_spike    — new JS error pattern >=10 occurrences in 10 min (v2)
+  6. oos_hot_product   — hot product (>=5 orders/7d) hits inventory=0 (v2)
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ async def run_proactive_checks_all_merchants() -> None:
             asyncio.create_task(
                 _check_payment_failures(row["shop_domain"], row["access_token"])
             )
+        asyncio.create_task(_resolve_stale_js_incidents())
     except Exception as exc:
         logger.error("Proactive check loop error: %s", exc)
 
@@ -70,7 +73,8 @@ async def _run_realtime_checks(shop_domain: str, event_type: str) -> None:
             merchant = await conn.fetchrow(
                 """
                 SELECT alert_threshold_pct, active, drop_streak, recovery_streak,
-                       avg_order_value, slack_webhook_url, checkout_conversion_baseline
+                       avg_order_value, slack_webhook_url, checkout_conversion_baseline,
+                       alert_email
                 FROM merchants WHERE shop_domain = $1
                 """,
                 shop_domain,
@@ -162,7 +166,7 @@ async def _check_checkout_funnel(
                 "baseline_rate": round(float(baseline_rate), 4),
             }),
         )
-        if merchant["slack_webhook_url"]:
+        if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_checkout_funnel_alert
                 await send_checkout_funnel_alert(
@@ -174,6 +178,7 @@ async def _check_checkout_funnel(
                     current_rate=current_rate,
                     baseline_rate=float(baseline_rate),
                     aov=aov,
+                    alert_email=merchant["alert_email"],
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -262,7 +267,7 @@ async def _check_order_silence(
             rev_loss_per_min, aov,
             json.dumps({"drop_pct": round(drop_pct, 1), "baseline": round(float(baseline), 2)}),
         )
-        if merchant["slack_webhook_url"]:
+        if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_silence_alert
                 await send_silence_alert(
@@ -272,6 +277,7 @@ async def _check_order_silence(
                     baseline=baseline,
                     current_volume=current_volume,
                     aov=aov,
+                    alert_email=merchant["alert_email"],
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -417,7 +423,7 @@ async def _check_abandonment_spike(
                 "baseline_rate": round(baseline_abandon_rate, 4),
             }),
         )
-        if merchant["slack_webhook_url"]:
+        if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_abandonment_alert
                 await send_abandonment_alert(
@@ -429,6 +435,7 @@ async def _check_abandonment_spike(
                     current_rate=current_abandon_rate,
                     baseline_rate=baseline_abandon_rate,
                     aov=aov,
+                    alert_email=merchant["alert_email"],
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -447,7 +454,7 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, active FROM merchants WHERE shop_domain=$1",
+                "SELECT slack_webhook_url, alert_email, active FROM merchants WHERE shop_domain=$1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
@@ -493,7 +500,7 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                 shop_domain,
                 json.dumps({"pending_count": len(orders), "total_at_risk": total_at_risk, "order_names": order_names}),
             )
-            if merchant["slack_webhook_url"]:
+            if merchant["slack_webhook_url"] or merchant["alert_email"]:
                 try:
                     from services.alerter import send_payment_failure_alert
                     await send_payment_failure_alert(
@@ -503,12 +510,355 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                         pending_count=len(orders),
                         order_names=order_names,
                         total_at_risk=total_at_risk,
+                        alert_email=merchant["alert_email"],
                     )
                     await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
                 except Exception as exc:
                     logger.error("Payment failure alert failed: %s", exc)
     except Exception as exc:
         logger.error("Payment failure check error for %s: %s", shop_domain, exc)
+
+
+# ---------------------------------------------------------------------------
+# Detector 5: JS error spike (v2)
+# ---------------------------------------------------------------------------
+
+_JS_SPIKE_MIN_COUNT = 10        # occurrences in 10-min window
+_JS_SPIKE_WINDOW_MIN = 10
+_JS_RESOLVE_QUIET_MIN = 60
+_JS_RESOLVE_MAX_COUNT = 3
+
+_JS_BASELINE_LOOKBACK_H = 24   # if seen in prior 24h → baseline noise, skip
+
+
+async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            merchant = await conn.fetchrow(
+                "SELECT slack_webhook_url, alert_email, active FROM merchants WHERE shop_domain = $1",
+                shop_domain,
+            )
+            if not merchant or not merchant["active"]:
+                return
+
+            now = datetime.now(timezone.utc)
+            window_start = now - timedelta(minutes=_JS_SPIKE_WINDOW_MIN)
+            baseline_start = now - timedelta(hours=_JS_BASELINE_LOOKBACK_H) - timedelta(minutes=_JS_SPIKE_WINDOW_MIN)
+
+            count_10min = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM js_error_events
+                WHERE shop_domain = $1 AND error_hash = $2 AND occurred_at >= $3
+                """,
+                shop_domain, error_hash, window_start,
+            ) or 0
+
+            if count_10min < _JS_SPIKE_MIN_COUNT:
+                return
+
+            # Skip if this error was already present in the 24h before the current window.
+            prior_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM js_error_events
+                WHERE shop_domain = $1 AND error_hash = $2
+                  AND occurred_at >= $3 AND occurred_at < $4
+                """,
+                shop_domain, error_hash, baseline_start, window_start,
+            ) or 0
+
+            if prior_count > 0:
+                return  # known baseline error, not new
+
+            active = await _get_active_incident(conn, shop_domain, "js_error_spike")
+
+            # Check if same hash is already tracked in an active incident.
+            if active:
+                detail = active.get("detail") or {}
+                if isinstance(detail, str):
+                    import json as _json
+                    try:
+                        detail = _json.loads(detail)
+                    except Exception:
+                        detail = {}
+                if detail.get("error_hash") == error_hash:
+                    return  # already open for this hash
+
+            # Fetch a sample message for the alert.
+            sample = await conn.fetchrow(
+                """
+                SELECT error_message, page_url FROM js_error_events
+                WHERE shop_domain = $1 AND error_hash = $2
+                ORDER BY occurred_at DESC LIMIT 1
+                """,
+                shop_domain, error_hash,
+            )
+            message = sample["error_message"] if sample else "unknown"
+            page_url = sample["page_url"] if sample else ""
+
+            import json as _json
+            incident_id = await conn.fetchval(
+                """
+                INSERT INTO incidents
+                    (shop_domain, checkout_rate_before, checkout_rate_during,
+                     estimated_revenue_loss_per_min, avg_order_value, notified,
+                     incident_type, detail)
+                VALUES ($1, 0, 0, 0, 0, FALSE, 'js_error_spike', $2::jsonb)
+                RETURNING id
+                """,
+                shop_domain,
+                _json.dumps({
+                    "error_hash": error_hash,
+                    "count_10min": count_10min,
+                    "message": message[:200],
+                    "page_url": page_url,
+                }),
+            )
+
+            webhook = merchant["slack_webhook_url"]
+            email = merchant["alert_email"]
+            if webhook or email:
+                try:
+                    from services.alerter import send_js_error_alert
+                    await send_js_error_alert(
+                        webhook_url=webhook,
+                        alert_email=email,
+                        shop_domain=shop_domain,
+                        incident_id=incident_id,
+                        count_10min=count_10min,
+                        message=message,
+                        page_url=page_url,
+                    )
+                    await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
+                except Exception as exc:
+                    logger.error("JS error alert failed for %s: %s", shop_domain, exc)
+    except Exception as exc:
+        logger.error("JS error spike check error for %s: %s", shop_domain, exc)
+
+
+async def _resolve_stale_js_incidents() -> None:
+    """Called from proactive monitor to resolve JS incidents that have gone quiet."""
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            open_js = await conn.fetch(
+                """
+                SELECT id, shop_domain, detail, started_at FROM incidents
+                WHERE incident_type = 'js_error_spike' AND resolved_at IS NULL
+                """,
+            )
+            for row in open_js:
+                import json as _json
+                detail = row["detail"] or {}
+                if isinstance(detail, str):
+                    try:
+                        detail = _json.loads(detail)
+                    except Exception:
+                        continue
+                error_hash = detail.get("error_hash")
+                if not error_hash:
+                    continue
+
+                quiet_start = datetime.now(timezone.utc) - timedelta(minutes=_JS_RESOLVE_QUIET_MIN)
+                count_last_hour = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM js_error_events
+                    WHERE shop_domain = $1 AND error_hash = $2 AND occurred_at >= $3
+                    """,
+                    row["shop_domain"], error_hash, quiet_start,
+                ) or 0
+
+                if count_last_hour < _JS_RESOLVE_MAX_COUNT:
+                    merchant = await conn.fetchrow(
+                        "SELECT slack_webhook_url, alert_email FROM merchants WHERE shop_domain = $1",
+                        row["shop_domain"],
+                    )
+                    now = datetime.now(timezone.utc)
+                    await conn.execute(
+                        "UPDATE incidents SET resolved_at=$1 WHERE id=$2", now, row["id"]
+                    )
+                    if merchant and (merchant["slack_webhook_url"] or merchant["alert_email"]):
+                        try:
+                            from services.alerter import send_recovery_alert
+                            duration_minutes = int((now - row["started_at"]).total_seconds() / 60)
+                            await send_recovery_alert(
+                                webhook_url=merchant["slack_webhook_url"],
+                                alert_email=merchant["alert_email"],
+                                shop_domain=row["shop_domain"],
+                                incident_id=row["id"],
+                                duration_minutes=duration_minutes,
+                                incident_type="js_error_spike",
+                            )
+                        except Exception as exc:
+                            logger.error("JS recovery alert failed: %s", exc)
+    except Exception as exc:
+        logger.error("Stale JS incident resolution error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Detector 6: OOS hot product (v2, gated by OOS_ENABLED)
+# ---------------------------------------------------------------------------
+
+_OOS_HOT_THRESHOLD = 5   # orders in last 7 days to be "hot"
+_OOS_LOOKBACK_DAYS = 7
+
+
+async def check_oos_hot_product(
+    shop_domain: str,
+    inventory_item_id: int,
+    available: int,
+) -> None:
+    from config import settings
+    if not settings.oos_enabled:
+        return
+
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            merchant = await conn.fetchrow(
+                "SELECT slack_webhook_url, alert_email, avg_order_value, active FROM merchants WHERE shop_domain = $1",
+                shop_domain,
+            )
+            if not merchant or not merchant["active"]:
+                return
+
+            # Look up the product_id from inventory_levels table
+            product_id = await conn.fetchval(
+                "SELECT product_id FROM inventory_levels WHERE shop_domain=$1 AND inventory_item_id=$2",
+                shop_domain, inventory_item_id,
+            )
+
+            if product_id is None:
+                # Can't identify product — can't check line_items
+                return
+
+            now = datetime.now(timezone.utc)
+            since = now - timedelta(days=_OOS_LOOKBACK_DAYS)
+
+            # Count orders for this product in the last 7 days
+            order_count = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(quantity), 0) FROM order_line_items
+                WHERE shop_domain = $1 AND product_id = $2 AND created_at >= $3
+                """,
+                shop_domain, product_id, since,
+            ) or 0
+
+            if order_count < _OOS_HOT_THRESHOLD:
+                return  # not a hot product
+
+            # Fetch product title
+            product_title = await conn.fetchval(
+                """
+                SELECT product_title FROM order_line_items
+                WHERE shop_domain = $1 AND product_id = $2
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                shop_domain, product_id,
+            ) or f"product #{product_id}"
+
+            # Fetch product price from most recent line item
+            unit_price = await conn.fetchval(
+                """
+                SELECT price FROM order_line_items
+                WHERE shop_domain = $1 AND product_id = $2 AND price IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                shop_domain, product_id,
+            )
+            if unit_price is None:
+                unit_price = float(merchant["avg_order_value"])
+
+            units_per_hour = order_count / (_OOS_LOOKBACK_DAYS * 24)
+            revenue_per_hour = round(units_per_hour * float(unit_price), 2)
+
+            if available > 0:
+                # Back in stock — resolve any open OOS incident for this product
+                active = await conn.fetchrow(
+                    """
+                    SELECT id, started_at FROM incidents
+                    WHERE shop_domain=$1 AND incident_type='oos_hot_product' AND resolved_at IS NULL
+                      AND detail->>'product_id' = $2::text
+                    LIMIT 1
+                    """,
+                    shop_domain, str(product_id),
+                )
+                if active:
+                    await conn.execute(
+                        "UPDATE incidents SET resolved_at=NOW() WHERE id=$1", active["id"]
+                    )
+                    if merchant["slack_webhook_url"] or merchant["alert_email"]:
+                        try:
+                            from services.alerter import send_recovery_alert
+                            duration_minutes = int(
+                                (now - active["started_at"]).total_seconds() / 60
+                            )
+                            await send_recovery_alert(
+                                webhook_url=merchant["slack_webhook_url"],
+                                alert_email=merchant["alert_email"],
+                                shop_domain=shop_domain,
+                                incident_id=active["id"],
+                                duration_minutes=duration_minutes,
+                                incident_type="oos_hot_product",
+                            )
+                        except Exception as exc:
+                            logger.error("OOS recovery alert failed: %s", exc)
+                return
+
+            # available == 0 — check for existing open incident
+            already_open = await conn.fetchrow(
+                """
+                SELECT id FROM incidents
+                WHERE shop_domain=$1 AND incident_type='oos_hot_product' AND resolved_at IS NULL
+                  AND detail->>'product_id' = $2::text
+                LIMIT 1
+                """,
+                shop_domain, str(product_id),
+            )
+            if already_open:
+                return
+
+            import json as _json
+            incident_id = await conn.fetchval(
+                """
+                INSERT INTO incidents
+                    (shop_domain, checkout_rate_before, checkout_rate_during,
+                     estimated_revenue_loss_per_min, avg_order_value, notified,
+                     incident_type, detail)
+                VALUES ($1, 0, 0, $2, $3, FALSE, 'oos_hot_product', $4::jsonb)
+                RETURNING id
+                """,
+                shop_domain,
+                round(revenue_per_hour / 60, 4),
+                float(unit_price),
+                _json.dumps({
+                    "product_id": product_id,
+                    "product_title": product_title,
+                    "inventory_item_id": inventory_item_id,
+                    "orders_last_7d": order_count,
+                    "estimated_revenue_per_hour": revenue_per_hour,
+                    "unit_price": float(unit_price),
+                }),
+            )
+
+            if merchant["slack_webhook_url"] or merchant["alert_email"]:
+                try:
+                    from services.alerter import send_oos_alert
+                    await send_oos_alert(
+                        webhook_url=merchant["slack_webhook_url"],
+                        alert_email=merchant["alert_email"],
+                        shop_domain=shop_domain,
+                        incident_id=incident_id,
+                        product_title=product_title,
+                        orders_last_7d=order_count,
+                        revenue_per_hour=revenue_per_hour,
+                        unit_price=float(unit_price),
+                    )
+                    await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
+                except Exception as exc:
+                    logger.error("OOS alert failed for %s: %s", shop_domain, exc)
+    except Exception as exc:
+        logger.error("OOS check error for %s/%d: %s", shop_domain, inventory_item_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +888,8 @@ async def _resolve_incident(
     await conn.execute(
         "UPDATE incidents SET resolved_at=$1 WHERE id=$2", now, active["id"]
     )
-    if merchant["slack_webhook_url"]:
+    alert_email = dict(merchant).get("alert_email")
+    if merchant["slack_webhook_url"] or alert_email:
         try:
             from services.alerter import send_recovery_alert
             duration_minutes = int((now - active["started_at"]).total_seconds() / 60)
@@ -547,6 +898,7 @@ async def _resolve_incident(
             )
             await send_recovery_alert(
                 webhook_url=merchant["slack_webhook_url"],
+                alert_email=alert_email,
                 shop_domain=shop_domain,
                 incident_id=active["id"],
                 duration_minutes=duration_minutes,
