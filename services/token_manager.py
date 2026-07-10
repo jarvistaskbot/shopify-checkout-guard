@@ -5,10 +5,14 @@ Handles:
 - One-time exchange of shpat_ non-expiring tokens → expiring tokens
 - Proactive refresh before expiry (30-min buffer)
 - Transparent get_valid_token() for all API callers
+
+Race condition prevention: per-shop asyncio.Lock ensures only one refresh
+runs at a time, avoiding double-refresh (second call would get invalid refresh token).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -18,6 +22,15 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REFRESH_BUFFER_SECONDS = 1800  # refresh 30 min before expiry
+
+# Per-shop lock prevents concurrent refresh calls from both exchanging the refresh token.
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_lock(shop: str) -> asyncio.Lock:
+    if shop not in _refresh_locks:
+        _refresh_locks[shop] = asyncio.Lock()
+    return _refresh_locks[shop]
 
 
 async def get_valid_token(
@@ -38,7 +51,6 @@ async def get_valid_token(
     expires_at = row["token_expires_at"]
     refresh_tok = row["refresh_token"]
 
-    # Non-expiring tokens have no expires_at — just return as-is (API will reject).
     if expires_at is None:
         return access_token
 
@@ -50,30 +62,42 @@ async def get_valid_token(
         logger.warning("Token expiring for %s but no refresh token stored", shop)
         return access_token
 
-    logger.info("Refreshing expiring token for %s", shop)
-    token_data = await _call_token_endpoint(
-        shop,
-        {
-            "client_id": api_key,
-            "client_secret": api_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_tok,
-        },
-    )
+    # Acquire per-shop lock to prevent concurrent refresh (Shopify invalidates
+    # the refresh token after first use; second concurrent call would fail).
+    async with _get_lock(shop):
+        # Re-read after acquiring lock — another task may have already refreshed.
+        row2 = await conn.fetchrow(
+            "SELECT access_token, refresh_token, token_expires_at FROM merchants WHERE shop_domain = $1",
+            shop,
+        )
+        if row2 and row2["token_expires_at"] and \
+                row2["token_expires_at"] - datetime.now(timezone.utc) > timedelta(seconds=_REFRESH_BUFFER_SECONDS):
+            return row2["access_token"]
 
-    new_token, new_refresh, new_expires_at = _parse_token_response(token_data)
-    await conn.execute(
-        """
-        UPDATE merchants
-        SET access_token = $1, refresh_token = $2, token_expires_at = $3
-        WHERE shop_domain = $4
-        """,
-        new_token,
-        new_refresh,
-        new_expires_at,
-        shop,
-    )
-    return new_token
+        logger.info("Refreshing expiring token for %s", shop)
+        token_data = await _call_token_endpoint(
+            shop,
+            {
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": row2["refresh_token"] if row2 else refresh_tok,
+            },
+        )
+
+        new_token, new_refresh, new_expires_at = _parse_token_response(token_data)
+        await conn.execute(
+            """
+            UPDATE merchants
+            SET access_token = $1, refresh_token = $2, token_expires_at = $3
+            WHERE shop_domain = $4
+            """,
+            new_token,
+            new_refresh,
+            new_expires_at,
+            shop,
+        )
+        return new_token
 
 
 async def exchange_to_expiring(
