@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -70,6 +72,14 @@ async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
       placeholder="https://hooks.slack.com/services/T.../B.../..."
       required
     />
+    <label for="alert_email" style="margin-top:20px;">Alert Email Address (optional)</label>
+    <p class="hint">Receive the same alerts by email via SendGrid.</p>
+    <input
+      type="text"
+      id="alert_email"
+      name="alert_email"
+      placeholder="you@yourstore.com"
+    />
     <button type="submit">Continue to billing &rarr;</button>
   </form>
 </body>
@@ -81,15 +91,85 @@ async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
 async def onboarding_save(
     shop: str = Form(...),
     slack_webhook_url: str = Form(...),
+    alert_email: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE merchants SET slack_webhook_url = $1 WHERE shop_domain = $2",
+            "UPDATE merchants SET slack_webhook_url = $1, alert_email = $2 WHERE shop_domain = $3",
             slack_webhook_url,
+            alert_email or None,
             shop,
         )
     return RedirectResponse(url=f"/billing/start?shop={shop}", status_code=303)
+
+
+@router.get("/demo", response_class=HTMLResponse)
+async def demo_page(success: str = Query(default="")) -> HTMLResponse:
+    if success == "1":
+        body = """
+  <h1>&#10003; CheckoutGuard is active</h1>
+  <p class="sub">Your Slack channel is now connected. We'll notify you the moment your order volume drops below normal.</p>
+  <div class="card">
+    <div class="card-title">What happens next</div>
+    <ul>
+      <li>CheckoutGuard monitors your order flow every <strong>30 minutes</strong></li>
+      <li>We compare against a <strong>7-day rolling baseline</strong></li>
+      <li>If volume drops &gt;50%, a Slack alert fires immediately</li>
+      <li>When volume recovers, a "Resolved" message is sent automatically</li>
+    </ul>
+  </div>
+  <p style="margin-top:32px;"><a href="/demo" style="color:#008060;font-weight:600;">&#8592; Back to setup demo</a></p>
+"""
+    else:
+        body = """
+  <h1>CheckoutGuard installed</h1>
+  <p class="sub">
+    Connected to <span class="shop">your-store.myshopify.com</span>.<br>
+    Enter your Slack Incoming Webhook URL to receive revenue drop alerts.
+  </p>
+  <form method="GET" action="/demo">
+    <input type="hidden" name="success" value="1" />
+    <label for="slack_webhook_url">Slack Incoming Webhook URL</label>
+    <p class="hint">
+      In Slack: Apps &rarr; Incoming Webhooks &rarr; Add to Slack &rarr; copy the webhook URL.
+    </p>
+    <input
+      type="text"
+      id="slack_webhook_url"
+      name="slack_webhook_url"
+      placeholder="https://hooks.slack.com/services/T.../B.../..."
+    />
+    <button type="submit">Connect Slack &rarr;</button>
+  </form>
+  <p class="demo-note">&#9432; This is a demo page for app review purposes.</p>
+"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>CheckoutGuard — Setup</title>
+  <style>
+{_STYLE}
+.card {{
+  background: #f6faf8;
+  border: 1px solid #d4e9e2;
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin-top: 24px;
+}}
+.card-title {{ font-weight: 700; font-size: 14px; margin-bottom: 12px; color: #008060; }}
+.card ul {{ margin: 0; padding-left: 20px; }}
+.card li {{ font-size: 14px; color: #333; margin-bottom: 8px; }}
+.demo-note {{ font-size: 12px; color: #999; margin-top: 24px; }}
+  </style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @router.get("/privacy", response_class=HTMLResponse)

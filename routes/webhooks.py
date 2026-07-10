@@ -55,6 +55,30 @@ async def order_created(
             order_id,
         )
 
+        # Store line items for hot-product OOS detection (v2).
+        line_items = payload.get("line_items", [])
+        shopify_order_id = payload.get("id")
+        if shopify_order_id and line_items:
+            for item in line_items:
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO order_line_items
+                            (shop_domain, shopify_order_id, product_id, product_title,
+                             variant_id, quantity, price)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        """,
+                        x_shopify_shop_domain,
+                        int(shopify_order_id),
+                        item.get("product_id"),
+                        (item.get("title") or "")[:500],
+                        item.get("variant_id"),
+                        int(item.get("quantity", 1)),
+                        float(item.get("price", 0)) if item.get("price") else None,
+                    )
+                except Exception as exc:
+                    logger.warning("line_item insert failed for order %s: %s", order_id, exc)
+
     await process_event(x_shopify_shop_domain, "order_created")
     return {"ok": True}
 
@@ -174,4 +198,45 @@ async def shop_redact(
         )
 
     logger.info("GDPR shop/redact: deleted data for %s", x_shopify_shop_domain)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# v2 webhook: inventory level updates (requires read_inventory scope)
+# ---------------------------------------------------------------------------
+
+@router.post("/inventory/update")
+async def inventory_updated(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(...),
+    x_shopify_shop_domain: str = Header(...),
+) -> dict:
+    body = await _verify_hmac(request, x_shopify_hmac_sha256)
+    payload = json.loads(body)
+
+    inventory_item_id = payload.get("inventory_item_id")
+    available = payload.get("available")
+
+    if inventory_item_id is None or available is None:
+        return {"ok": True}
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO inventory_levels (shop_domain, inventory_item_id, available, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (shop_domain, inventory_item_id)
+            DO UPDATE SET available = EXCLUDED.available, updated_at = NOW()
+            """,
+            x_shopify_shop_domain,
+            int(inventory_item_id),
+            int(available),
+        )
+
+    from services.detector import check_oos_hot_product
+    import asyncio
+    asyncio.create_task(
+        check_oos_hot_product(x_shopify_shop_domain, int(inventory_item_id), int(available))
+    )
     return {"ok": True}

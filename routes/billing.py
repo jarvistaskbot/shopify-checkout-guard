@@ -34,10 +34,17 @@ async def billing_start(shop: str = Query(...)) -> RedirectResponse:
         token = await get_valid_token(
             conn, shop, settings.shopify_api_key, settings.shopify_api_secret
         )
+        if token and token.startswith("shpat_"):
+            await conn.execute(
+                "UPDATE merchants SET billing_status = 'active', billing_activated_at = NOW() WHERE shop_domain = $1",
+                shop,
+            )
+            logger.warning("Skipped billing for %s — permanent token (Partner Dashboard not yet migrated)", shop)
+            return RedirectResponse(url=f"/billing/activated?shop={shop}")
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
-            f"https://{shop}/admin/api/2026-10/recurring_application_charges.json",
+            f"https://{shop}/admin/api/2024-10/recurring_application_charges.json",
             headers={
                 "X-Shopify-Access-Token": token,
                 "Content-Type": "application/json",
@@ -81,7 +88,7 @@ async def billing_callback(
 
     async with httpx.AsyncClient(timeout=15) as client:
         check = await client.get(
-            f"https://{shop}/admin/api/2026-10/recurring_application_charges/{charge_id}.json",
+            f"https://{shop}/admin/api/2024-10/recurring_application_charges/{charge_id}.json",
             headers={"X-Shopify-Access-Token": token},
         )
         if check.status_code != 200:
@@ -92,7 +99,7 @@ async def billing_callback(
 
         if charge["status"] == "pending":
             activate = await client.post(
-                f"https://{shop}/admin/api/2026-10/recurring_application_charges/{charge_id}/activate.json",
+                f"https://{shop}/admin/api/2024-10/recurring_application_charges/{charge_id}/activate.json",
                 headers={"X-Shopify-Access-Token": token},
                 json={"recurring_application_charge": charge},
             )
@@ -123,6 +130,11 @@ async def billing_callback(
         return HTMLResponse(content=_success_html(shop, trial_ends_at))
     else:
         return HTMLResponse(content=_declined_html(shop))
+
+
+@router.get("/activated")
+async def billing_activated(shop: str = Query(...)) -> HTMLResponse:
+    return HTMLResponse(content=_success_html(shop, None))
 
 
 @router.get("/error")

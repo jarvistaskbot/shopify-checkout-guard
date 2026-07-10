@@ -44,7 +44,6 @@ async def install(shop: str = Query(..., description="Shopify shop domain")) -> 
         f"&scope={_SCOPES}"
         f"&redirect_uri={callback}"
         f"&state={nonce}"
-        f"&grant_options%5B%5D=offline"
     )
     return RedirectResponse(url)
 
@@ -117,10 +116,20 @@ async def callback(
     asyncio.create_task(_subscribe_webhooks(shop, access_token))
     asyncio.create_task(_fetch_and_store_aov(shop, access_token))
 
+    # Returning merchants (already configured) go straight to dashboard.
+    pool2 = await get_pool()
+    async with pool2.acquire() as conn2:
+        has_config = await conn2.fetchval(
+            "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
+            shop,
+        )
+    if has_config:
+        return RedirectResponse(url=f"/dashboard?shop={shop}")
     return RedirectResponse(url=f"/onboarding?shop={shop}")
 
 
 async def _subscribe_webhooks(shop: str, access_token: str) -> None:
+    from config import settings as _settings
     topics = [
         ("orders/create", "/webhooks/orders/create"),
         ("app/uninstalled", "/webhooks/app/uninstalled"),
@@ -129,6 +138,8 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
         ("shop/redact", "/webhooks/shop/redact"),
         ("checkouts/create", "/webhooks/checkouts/create"),
         ("checkouts/delete", "/webhooks/checkouts/delete"),
+        # v2: inventory topic (only registers if OOS_ENABLED — requires read_inventory scope granted post-approval)
+        *([("inventory_levels/update", "/webhooks/inventory/update")] if _settings.oos_enabled else []),
     ]
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await client.get(
