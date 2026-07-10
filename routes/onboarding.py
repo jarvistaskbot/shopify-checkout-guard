@@ -1,9 +1,12 @@
+from html import escape
 from typing import Optional
 
-from fastapi import APIRouter, Form, Query
+from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from config import settings
 from database import get_pool
+from session import COOKIE_NAME, csrf_token_for, verify_session_token
 
 router = APIRouter()
 
@@ -44,8 +47,27 @@ button:hover { background: #006e52; }
 """
 
 
+def _require_session(request: Request, shop: str) -> Optional[str]:
+    """Return verified shop from cookie, or None if invalid/missing."""
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    if not cookie_val:
+        return None
+    verified = verify_session_token(cookie_val, settings.secret_key)
+    if not verified or verified != shop:
+        return None
+    return verified
+
+
 @router.get("/onboarding", response_class=HTMLResponse)
-async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
+async def onboarding_page(request: Request, shop: str = Query(...)) -> HTMLResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
+    # Derive CSRF token from session cookie.
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    csrf = csrf_token_for(cookie_val, settings.secret_key)
+    safe_shop = escape(shop)
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -56,11 +78,12 @@ async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
 <body>
   <h1>CheckoutGuard installed</h1>
   <p class="sub">
-    Connected to <span class="shop">{shop}</span>.<br>
+    Connected to <span class="shop">{safe_shop}</span>.<br>
     Enter your Slack Incoming Webhook URL to receive revenue drop alerts.
   </p>
   <form method="POST" action="/onboarding">
-    <input type="hidden" name="shop" value="{shop}" />
+    <input type="hidden" name="shop" value="{safe_shop}" />
+    <input type="hidden" name="csrf_token" value="{csrf}" />
     <label for="slack_webhook_url">Slack Incoming Webhook URL</label>
     <p class="hint">
       In Slack: Apps &rarr; Incoming Webhooks &rarr; Add to Slack &rarr; copy the webhook URL.
@@ -89,10 +112,21 @@ async def onboarding_page(shop: str = Query(...)) -> HTMLResponse:
 
 @router.post("/onboarding")
 async def onboarding_save(
+    request: Request,
     shop: str = Form(...),
     slack_webhook_url: str = Form(...),
     alert_email: Optional[str] = Form(default=None),
+    csrf_token: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
+    # Verify session cookie and CSRF token.
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    expected_csrf = csrf_token_for(cookie_val, settings.secret_key)
+    if not csrf_token or csrf_token != expected_csrf:
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -101,7 +135,7 @@ async def onboarding_save(
             alert_email or None,
             shop,
         )
-    return RedirectResponse(url=f"/billing/start?shop={shop}", status_code=303)
+    return RedirectResponse(url=f"/billing/start?shop={escape(shop)}", status_code=303)
 
 
 @router.get("/demo", response_class=HTMLResponse)
@@ -174,23 +208,23 @@ async def demo_page(success: str = Query(default="")) -> HTMLResponse:
 
 @router.get("/privacy", response_class=HTMLResponse)
 async def privacy_policy() -> HTMLResponse:
-    html = f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <title>CheckoutGuard — Privacy Policy</title>
   <style>
-    body {{
+    body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       max-width: 720px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.7;
-    }}
-    h1 {{ font-size: 24px; }}
-    h2 {{ font-size: 17px; margin-top: 32px; }}
-    p, li {{ color: #333; font-size: 15px; }}
+    }
+    h1 { font-size: 24px; }
+    h2 { font-size: 17px; margin-top: 32px; }
+    p, li { color: #333; font-size: 15px; }
   </style>
 </head>
 <body>
-  <h1>Privacy Policy — CheckoutGuard</h1>
+  <h1>Privacy Policy &mdash; CheckoutGuard</h1>
   <p><em>Last updated: July 2026</em></p>
 
   <h2>What we collect</h2>
@@ -198,14 +232,13 @@ async def privacy_policy() -> HTMLResponse:
   <ul>
     <li>Your Shopify store domain (e.g. <code>your-store.myshopify.com</code>)</li>
     <li>Order creation timestamps and order IDs (not customer names, emails, or payment details)</li>
-    <li>Your Slack Incoming Webhook URL (stored encrypted, used only to send you alerts)</li>
+    <li>Your Slack Incoming Webhook URL (used only to send you alerts)</li>
   </ul>
 
   <h2>What we do not collect</h2>
   <ul>
     <li>Customer names, email addresses, or any PII</li>
     <li>Payment or billing card data</li>
-    <li>Product details or inventory data</li>
   </ul>
 
   <h2>How we use your data</h2>
@@ -217,12 +250,14 @@ async def privacy_policy() -> HTMLResponse:
 
   <h2>Data retention</h2>
   <p>
-    Order event records are retained for 30 days to maintain a rolling baseline.
-    When you uninstall CheckoutGuard, your store data is deleted within 48 hours.
+    Checkout event records older than 90 days are automatically purged.
+    When you uninstall CheckoutGuard, your store data is deleted within 48 hours upon
+    receipt of the Shopify <code>shop/redact</code> webhook.
   </p>
 
   <h2>Contact</h2>
-  <p>For data requests or questions, contact: <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
+  <p>For data requests or questions, contact:
+    <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
 </body>
 </html>"""
     return HTMLResponse(content=html)

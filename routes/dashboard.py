@@ -1,16 +1,19 @@
 """
 Incidents dashboard — server-rendered HTML, last 7 days of incidents.
-Mirrors the styling from onboarding.py.
+Auth: requires valid cg_session HttpOnly cookie (set at OAuth callback).
 """
 
 import json
 import logging
 from datetime import datetime, timezone, timedelta
+from html import escape
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
+from config import settings
 from database import get_pool
+from session import COOKIE_NAME, verify_session_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -59,6 +62,7 @@ tr:last-child td { border-bottom: none; }
 h2 { font-size: 16px; margin: 28px 0 12px; }
 .empty { color: #999; font-size: 14px; padding: 20px 0; }
 a { color: #008060; }
+.ai-note { font-size: 12px; color: #555; font-style: italic; margin-top: 4px; }
 """
 
 _INCIDENT_LABELS = {
@@ -69,6 +73,17 @@ _INCIDENT_LABELS = {
     "js_error_spike": "JS Error Spike",
     "oos_hot_product": "Out-of-Stock Alert",
 }
+
+
+def _require_session(request: Request, shop: str):
+    """Return shop from cookie or raise RedirectResponse to OAuth."""
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    if not cookie_val:
+        return None
+    verified_shop = verify_session_token(cookie_val, settings.secret_key)
+    if not verified_shop or verified_shop != shop:
+        return None
+    return verified_shop
 
 
 def _fmt_dt(dt: datetime) -> str:
@@ -95,7 +110,11 @@ def _fmt_impact(row) -> str:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(shop: str = Query(...)) -> HTMLResponse:
+async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
+    # Verify session cookie.
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         merchant = await conn.fetchrow(
@@ -114,7 +133,7 @@ async def dashboard(shop: str = Query(...)) -> HTMLResponse:
 
         active_incidents = await conn.fetch(
             """SELECT id, incident_type, started_at, resolved_at,
-                      estimated_revenue_loss_per_min, avg_order_value, detail
+                      estimated_revenue_loss_per_min, avg_order_value, detail, ai_analysis
                FROM incidents WHERE shop_domain = $1 AND resolved_at IS NULL
                ORDER BY started_at DESC""",
             shop,
@@ -122,7 +141,7 @@ async def dashboard(shop: str = Query(...)) -> HTMLResponse:
 
         recent_incidents = await conn.fetch(
             """SELECT id, incident_type, started_at, resolved_at,
-                      estimated_revenue_loss_per_min, avg_order_value, detail
+                      estimated_revenue_loss_per_min, avg_order_value, detail, ai_analysis
                FROM incidents WHERE shop_domain = $1 AND started_at >= $2
                ORDER BY started_at DESC LIMIT 50""",
             shop, since,
@@ -140,6 +159,11 @@ async def dashboard(shop: str = Query(...)) -> HTMLResponse:
             shop, since,
         ) or 0
 
+    # Mask Slack webhook URL — show only last 6 chars, never the full URL.
+    slack_masked = None
+    if merchant["slack_webhook_url"]:
+        slack_masked = "..." + merchant["slack_webhook_url"][-6:]
+
     return HTMLResponse(content=_render(
         shop=shop,
         calibrating=calibrating,
@@ -148,6 +172,8 @@ async def dashboard(shop: str = Query(...)) -> HTMLResponse:
         recent_incidents=list(recent_incidents),
         checkout_count=checkout_count,
         order_count=order_count,
+        slack_masked=slack_masked,
+        alert_email=merchant["alert_email"],
     ))
 
 
@@ -159,7 +185,10 @@ def _render(
     recent_incidents: list,
     checkout_count: int,
     order_count: int,
+    slack_masked=None,
+    alert_email=None,
 ) -> str:
+    safe_shop = escape(shop)
     conversion_rate = (
         f"{order_count / checkout_count * 100:.1f}%"
         if checkout_count > 0 else "—"
@@ -225,10 +254,14 @@ def _render(
                 mins = int((datetime.now(timezone.utc) - row["started_at"]).total_seconds() / 60)
                 duration = f"{mins} min (ongoing)"
 
+            ai_note = ""
+            if row.get("ai_analysis"):
+                ai_note = f'<div class="ai-note">AI: {escape(row["ai_analysis"][:200])}</div>'
+
             rows += f"""
 <tr>
   <td>{_fmt_dt(row["started_at"])}</td>
-  <td>{label}</td>
+  <td>{label}{ai_note}</td>
   <td>{status}</td>
   <td>{duration}</td>
   <td>{impact}</td>
@@ -246,6 +279,14 @@ def _render(
     else:
         table_html = '<p class="empty">No incidents in the last 7 days.</p>'
 
+    # Alert settings summary (masked)
+    settings_lines = []
+    if slack_masked:
+        settings_lines.append(f"Slack: connected ({escape(slack_masked)})")
+    if alert_email:
+        settings_lines.append(f"Email: {escape(alert_email)}")
+    settings_summary = " &bull; ".join(settings_lines) if settings_lines else "No alert channels configured."
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -255,13 +296,14 @@ def _render(
 </head>
 <body>
   <h1>CheckoutGuard Dashboard</h1>
-  <p class="sub">Monitoring <span class="shop">{shop}</span></p>
+  <p class="sub">Monitoring <span class="shop">{safe_shop}</span></p>
   <div class="banner {banner_cls}">{banner_text}</div>
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
   <p style="margin-top:32px; font-size:13px; color:#999;">
-    <a href="/onboarding?shop={shop}">Update alert settings</a>
+    {settings_summary}<br>
+    <a href="/onboarding?shop={safe_shop}">Update alert settings</a>
   </p>
 </body>
 </html>"""

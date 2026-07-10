@@ -9,14 +9,17 @@ Flow:
 
 import logging
 from datetime import datetime, timezone, timedelta
+from html import escape
+from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
 from database import get_pool
 from services.token_manager import get_valid_token
+from session import COOKIE_NAME, verify_session_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing")
@@ -24,11 +27,23 @@ router = APIRouter(prefix="/billing")
 _PLAN_NAME = "CheckoutGuard Pro"
 _PLAN_PRICE = 29.0
 _TRIAL_DAYS = 14
-_TEST_MODE = True  # Set to False before going live with real billing
+
+
+def _require_session(request: Request, shop: str) -> Optional[str]:
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    if not cookie_val:
+        return None
+    verified = verify_session_token(cookie_val, settings.secret_key)
+    if not verified or verified != shop:
+        return None
+    return verified
 
 
 @router.get("/start")
-async def billing_start(shop: str = Query(...)) -> RedirectResponse:
+async def billing_start(request: Request, shop: str = Query(...)) -> RedirectResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         token = await get_valid_token(
@@ -40,7 +55,8 @@ async def billing_start(shop: str = Query(...)) -> RedirectResponse:
                 shop,
             )
             logger.warning("Skipped billing for %s — permanent token (Partner Dashboard not yet migrated)", shop)
-            return RedirectResponse(url=f"/billing/activated?shop={shop}")
+            resp = RedirectResponse(url=f"/billing/activated?shop={escape(shop)}")
+            return resp
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -55,13 +71,13 @@ async def billing_start(shop: str = Query(...)) -> RedirectResponse:
                     "price": str(_PLAN_PRICE),
                     "return_url": f"{settings.app_url}/billing/callback",
                     "trial_days": _TRIAL_DAYS,
-                    "test": _TEST_MODE,
+                    "test": settings.billing_test_mode,
                 }
             },
         )
         if resp.status_code not in (200, 201):
             logger.error("Failed to create billing charge for %s: %s", shop, resp.text)
-            return RedirectResponse(url=f"/billing/error?shop={shop}")
+            return RedirectResponse(url=f"/billing/error?shop={escape(shop)}")
         charge = resp.json()["recurring_application_charge"]
 
     pool = await get_pool()
@@ -77,9 +93,13 @@ async def billing_start(shop: str = Query(...)) -> RedirectResponse:
 
 @router.get("/callback")
 async def billing_callback(
+    request: Request,
     charge_id: str = Query(...),
     shop: str = Query(...),
 ) -> HTMLResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         token = await get_valid_token(
@@ -133,12 +153,16 @@ async def billing_callback(
 
 
 @router.get("/activated")
-async def billing_activated(shop: str = Query(...)) -> HTMLResponse:
+async def billing_activated(request: Request, shop: str = Query(...)) -> HTMLResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
     return HTMLResponse(content=_success_html(shop, None))
 
 
 @router.get("/error")
-async def billing_error(shop: str = Query(...)) -> HTMLResponse:
+async def billing_error(request: Request, shop: str = Query(...)) -> HTMLResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
     return HTMLResponse(content=_error_html(shop))
 
 
@@ -155,6 +179,7 @@ a { color: #008060; }
 
 
 def _success_html(shop: str, trial_ends_at) -> str:
+    safe_shop = escape(shop)
     trial_line = ""
     if trial_ends_at:
         trial_date = trial_ends_at.strftime("%B %d, %Y")
@@ -165,7 +190,7 @@ def _success_html(shop: str, trial_ends_at) -> str:
 <body>
   <div class="icon">&#x2705;</div>
   <h1>You&rsquo;re all set</h1>
-  <p class="sub">CheckoutGuard is now monitoring <strong>{shop}</strong> for revenue drops.</p>
+  <p class="sub">CheckoutGuard is now monitoring <strong>{safe_shop}</strong> for revenue drops.</p>
   {trial_line}
   <p class="sub">You&rsquo;ll receive a Slack alert if order volume drops &ge;20% below your 7-day baseline.</p>
 </body>
@@ -173,24 +198,27 @@ def _success_html(shop: str, trial_ends_at) -> str:
 
 
 def _declined_html(shop: str) -> str:
+    safe_shop = escape(shop)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>CheckoutGuard — Billing</title><style>{_CSS}</style></head>
 <body>
   <h1>Billing not confirmed</h1>
-  <p class="sub">You declined billing for <strong>{shop}</strong>.</p>
-  <p class="sub"><a href="/billing/start?shop={shop}">Try again</a> to activate CheckoutGuard.</p>
+  <p class="sub">You declined billing for <strong>{safe_shop}</strong>.</p>
+  <p class="sub"><a href="/billing/start?shop={safe_shop}">Try again</a> to activate CheckoutGuard.</p>
 </body>
 </html>"""
 
 
 def _error_html(shop: str) -> str:
+    safe_shop = escape(shop)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>CheckoutGuard — Error</title><style>{_CSS}</style></head>
 <body>
   <h1>Billing setup failed</h1>
-  <p class="sub">Could not create a billing charge for <strong>{shop}</strong>. Please contact support.</p>
-  <p class="sub"><a href="/billing/start?shop={shop}">Retry</a></p>
+  <p class="sub">Could not create a billing charge for <strong>{safe_shop}</strong>.</p>
+  <p class="sub">Please contact <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
+  <p class="sub"><a href="/billing/start?shop={safe_shop}">Retry</a></p>
 </body>
 </html>"""
