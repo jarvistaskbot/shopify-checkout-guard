@@ -5,6 +5,7 @@ Rate-limited and payload-capped; drops events from unknown shops.
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from typing import Optional
@@ -52,7 +53,6 @@ def _sanitize_shop(shop: str) -> str:
     shop = shop.strip().lower()
     if len(shop) > 100 or not shop:
         return ""
-    # Must look like a myshopify domain or custom domain — basic sanity
     if " " in shop or ".." in shop:
         return ""
     return shop
@@ -60,12 +60,14 @@ def _sanitize_shop(shop: str) -> str:
 
 @router.post("/events")
 async def ingest_events(request: Request) -> dict:
-    content_length = int(request.headers.get("content-length", 0))
-    if content_length > _MAX_PAYLOAD_BYTES:
+    # Read body first and enforce size limit on actual bytes (not Content-Length header,
+    # which can be spoofed or omitted).
+    body_bytes = await request.body()
+    if len(body_bytes) > _MAX_PAYLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Payload too large")
 
     try:
-        body = await request.json()
+        body = json.loads(body_bytes)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
