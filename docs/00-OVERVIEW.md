@@ -49,7 +49,9 @@ CheckoutGuard is a Shopify app that detects silent revenue bleed by monitoring r
 │                                                                  │
 │  Background Tasks (asyncio loops):                               │
 │  ├─ _token_refresh_loop()       Every 20 min — refresh expiring  │
-│  └─ _proactive_monitor_loop()   Every 5 min — payment + JS stale │
+│  ├─ _proactive_monitor_loop()   Every 5 min — payment + JS stale │
+│  ├─ _data_retention_loop()      Every 1 hr  — purge old records  │
+│  └─ _weekly_digest_loop()       Every 1 hr  — send 7-day digests │
 └───────────────────┬──────────────────────────────────────────────┘
                     │
                     ▼
@@ -144,11 +146,11 @@ _proactive_monitor_loop()
 
 | Integration | Purpose | Auth | Notes |
 |---|---|---|---|
-| Shopify Admin API 2024-10 | Order/webhook queries, billing | Per-merchant access_token | Token may expire (refresh supported) |
+| Shopify Admin API 2024-10 | Order/webhook queries, billing, OOS resolution | Per-merchant access_token | Token may expire (refresh supported) |
 | Shopify OAuth | App install/auth | HMAC + client_secret | Non-embedded flow |
 | Slack Incoming Webhooks | Incident alerts | Merchant-supplied URL | No auth from our side |
-| SendGrid v3 | Email alerts | Bearer API key | From alerts@checkoutguardalerts.com |
-| Anthropic/Claude | AI incident analysis | Not yet integrated | Planned (Haiku), not built |
+| SendGrid v3 | Email alerts + weekly digest | Bearer API key | From alerts@checkoutguardalerts.com |
+| Anthropic API (Haiku) | AI incident analysis | `ANTHROPIC_API_KEY` | `claude-haiku-4-5-20251001`, fail-silent, 150 tokens, 10s timeout |
 
 ---
 
@@ -162,11 +164,15 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 | `SHOPIFY_API_KEY` | Yes | `""` | OAuth client_id for all API calls | `routes/auth.py`, `main.py:_token_refresh_loop`, `routes/billing.py` |
 | `SHOPIFY_API_SECRET` | Yes | `""` | HMAC signing + token exchange | `routes/auth.py`, `routes/webhooks.py:_verify_hmac` |
 | `APP_URL` | Yes | `""` | Base URL for redirect_uri + webhook addresses | `routes/auth.py:callback+_subscribe_webhooks` |
+| `SECRET_KEY` | Yes | `dev-secret-change-in-prod` | HMAC key for session cookies + CSRF tokens | `session.py`, all merchant-facing routes |
 | `SENDGRID_API_KEY` | No | `""` | Email via SendGrid v3 | `services/alerter.py:_send_email` |
 | `OOS_ENABLED` | No | `False` | Feature flag: enable OOS (inventory) detection | `services/detector.py:check_oos_hot_product`, `routes/auth.py:_subscribe_webhooks` |
+| `BILLING_TEST_MODE` | No | `False` | If true, Shopify charges are test-mode | `routes/billing.py` — set `false` in production |
+| `AI_ANALYSIS_ENABLED` | No | `True` | Enable Haiku AI incident analysis | `services/ai_analyst.py:analyze_incident` |
+| `ANTHROPIC_API_KEY` | No | `""` | Anthropic API key for Haiku | `services/ai_analyst.py` — leave blank to disable |
 
 > ⚠️ No `SLACK_WEBHOOK_URL` global env — each merchant stores their own webhook URL in the DB.  
-> ⚠️ No `SECRET_KEY` for session management — dashboard has NO auth at all (see AUDIT-SECURITY.md).
+> ⚠️ Set `SECRET_KEY` to a random 32-byte hex string in production — never use the dev default.
 
 ---
 
@@ -174,22 +180,25 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 
 | Feature | Status | Notes |
 |---|---|---|
-| Shopify OAuth install/uninstall | ✅ v1 live | Expiring token + refresh supported |
+| Shopify OAuth install/uninstall | ✅ v1 live | Expiring token + refresh supported; nonces now DB-backed |
 | Checkout funnel collapse detector | ✅ v1 live | 30-min window, 7-day baseline |
 | Order silence detector | ✅ v1 live | Day-of-week aware, 28-day lookback |
-| Abandonment spike detector | ✅ v1 live | Baseline query has a window mismatch bug |
-| Payment failure detector | ✅ v1 live | Polls Shopify API every 5 min |
-| Slack alerts | ✅ v1 live | Per incident type |
+| Abandonment spike detector | ✅ v1 live | Baseline window mismatch FIXED (bl_orders upper bound) |
+| Payment failure detector | ✅ v1 live | Auto-resolve FIXED; polls Shopify API every 5 min |
+| Slack alerts | ✅ v1 live | Per incident type; AI analysis appended when available |
 | Email alerts (SendGrid) | ✅ v2 built | Requires SENDGRID_API_KEY |
 | JS error spike detector | ✅ v2 built | Not deployed yet |
-| OOS hot product detector | ⚠️ v2 built, BROKEN | product_id never populated in inventory_levels |
+| OOS hot product detector | ✅ v2 built, FIXED | product_id resolved via Shopify API and cached on first webhook |
 | Theme App Extension (JS) | ✅ v2 built | Liquid block + assets/error-tracker.js |
-| Dashboard (server-rendered) | ✅ v2 built | No auth — any request with shop= is served |
-| Billing (Shopify charges) | ✅ built | TEST_MODE=True hardcoded — must fix before live |
+| Dashboard (server-rendered) | ✅ v2 built, SECURED | HMAC session cookie required; Slack webhook masked; XSS escaped |
+| Billing (Shopify charges) | ✅ built, FIXED | BILLING_TEST_MODE env var (default false); XSS escaped |
 | GDPR webhooks | ✅ v1 live | 3 required webhooks implemented |
-| Token refresh | ✅ v1 live | 20-min background loop + on-demand in `get_valid_token` |
-| AI incident analysis (Haiku) | ❌ planned | Not started |
-| Weekly digest email | ❌ planned | Not started (approved requirement) |
+| Token refresh | ✅ v1 live | 20-min loop + per-shop Lock prevents race condition |
+| Session auth (HttpOnly cookie) | ✅ v2 built | HMAC-signed, 30-day TTL, SECRET_KEY-derived |
+| CSRF protection | ✅ v2 built | Stateless token derived from session on POST /onboarding |
+| Data retention | ✅ v2 built | Hourly loop purges events >90d, line items >7d, nonces >15min |
+| AI incident analysis (Haiku) | ✅ v2 built | claude-haiku-4-5-20251001, fail-silent, 600-char diagnosis |
+| Weekly digest email | ✅ v2 built | 7-day stats + optional Haiku summary; hourly check |
 | Multi-plan billing tiers | ❌ planned | Only one plan ($29) exists |
 | Agency / multi-store view | ❌ planned | Not started |
 | Embedded App Bridge UI | ❌ never built | embedded=false in toml; dashboard is external page |
@@ -200,11 +209,8 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 
 ## 8. Known Limitations
 
-1. **Single-process**: In-memory nonce store and rate limiter break under horizontal scaling. Multi-instance requires Redis.
-2. **No session auth on dashboard**: `/dashboard?shop=X` is accessible to anyone.
-3. **OOS detection non-functional**: `product_id` is never stored in `inventory_levels` on webhook receive.
-4. **No data retention jobs**: Tables grow unbounded despite privacy policy promising 30-day retention.
-5. **Billing in test mode**: `_TEST_MODE = True` in billing.py — charges are test charges, not real.
-6. **Non-embedded UI**: Shopify may flag `embedded=false` during App Store review; the UI does not load inside Shopify Admin iframe.
-7. **Theme Extension JS double-execution**: Both the Liquid inline script and the external `error-tracker.js` asset fire event listeners — errors will be captured and queued twice.
-8. **Sequential proactive loop**: Payment failure checks run sequentially per merchant; at scale (100+ merchants) each 5-min loop takes >N×100ms.
+1. **Single-process**: In-memory rate limiter breaks under horizontal scaling. Nonces are now DB-backed (fixed). Multi-instance rate limiting requires Redis.
+2. **Non-embedded UI**: Shopify may flag `embedded=false` during App Store review; the UI does not load inside Shopify Admin iframe.
+3. **Theme Extension JS double-execution**: Both the Liquid inline script and the external `error-tracker.js` asset fire event listeners — errors will be captured and queued twice.
+4. **Sequential proactive loop**: Payment failure checks run sequentially per merchant; at scale (100+ merchants) each 5-min loop takes >N×100ms.
+5. **BILLING_TEST_MODE must be set false in prod**: Default in config is false, but the `.env` shipped with the repo has `BILLING_TEST_MODE=true` for local dev. Verify env before deploy.
