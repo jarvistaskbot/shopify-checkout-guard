@@ -19,9 +19,27 @@ api_version = "2026-10"
   uri = "/webhooks/app/uninstalled"
   topics = [ "app/uninstalled" ]
 
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/data_request" ]
+  uri = "/webhooks/customers/data_request"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/redact" ]
+  uri = "/webhooks/customers/redact"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "shop/redact" ]
+  uri = "/webhooks/shop/redact"
+
+  # v2: inventory tracking (deploy ONLY after App Store approval + read_inventory scope granted)
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/inventory/update"
+  topics = [ "inventory_levels/update" ]
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_checkouts,read_orders"
+# v2 adds read_inventory + read_products (deploy ONLY after App Store approval + scope grant)
+scopes = "read_checkouts,read_orders,read_inventory,read_products"
 
 [auth]
 redirect_urls = [ "https://checkoutguardalerts.com/auth/callback" ]

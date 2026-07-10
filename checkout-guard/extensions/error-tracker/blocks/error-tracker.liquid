@@ -1,0 +1,41 @@
+{% comment %}
+  CheckoutGuard Error Tracker block.
+  Add to product and cart templates in the Theme Editor.
+  DO NOT add to checkout templates (checkout.liquid deprecated for non-Plus stores).
+{% endcomment %}
+
+<script>
+  (function () {
+    var SHOP = {{ shop.permanent_domain | json }};
+    var ENDPOINT = "https://checkoutguardalerts.com/events";
+    var BATCH_INTERVAL = 10000;
+    var queue = [];
+    var timer = null;
+
+    function flush() {
+      if (!queue.length) return;
+      var events = queue.splice(0);
+      try {
+        navigator.sendBeacon
+          ? navigator.sendBeacon(ENDPOINT, new Blob([JSON.stringify(events)], { type: "application/json" }))
+          : fetch(ENDPOINT, { method: "POST", body: JSON.stringify(events), headers: { "Content-Type": "application/json" }, keepalive: true });
+      } catch (_) {}
+    }
+
+    function enqueue(message, source) {
+      queue.push({ shop: SHOP, message: String(message).slice(0, 500), source: String(source || "").slice(0, 200), url: location.href, ts: Date.now() });
+      if (!timer) timer = setTimeout(function () { timer = null; flush(); }, BATCH_INTERVAL);
+    }
+
+    window.addEventListener("error", function (e) { enqueue(e.message || "unknown error", e.filename); });
+    window.addEventListener("unhandledrejection", function (e) { enqueue(String(e.reason && e.reason.message || e.reason || "unhandled rejection"), "promise"); });
+  })();
+</script>
+
+{% schema %}
+{
+  "name": "CheckoutGuard Error Tracker",
+  "target": "section",
+  "javascript": "error-tracker.js"
+}
+{% endschema %}
