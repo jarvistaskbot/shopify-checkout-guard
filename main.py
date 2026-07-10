@@ -8,6 +8,8 @@ from config import settings
 from database import create_pool, get_pool
 from routes.auth import router as auth_router
 from routes.billing import router as billing_router
+from routes.dashboard import router as dashboard_router
+from routes.events import router as events_router
 from routes.onboarding import router as onboarding_router
 from routes.webhooks import router as webhook_router
 from services.detector import run_proactive_checks_all_merchants
@@ -73,6 +75,8 @@ app = FastAPI(title="CheckoutGuard", lifespan=lifespan)
 
 app.include_router(auth_router)
 app.include_router(billing_router)
+app.include_router(dashboard_router)
+app.include_router(events_router)
 app.include_router(onboarding_router)
 app.include_router(webhook_router)
 
