@@ -4,6 +4,7 @@ Sends Slack messages (always) and email via SendGrid (when configured).
 """
 
 import logging
+from typing import Optional
 
 import httpx
 
@@ -19,6 +20,12 @@ _INCIDENT_LABELS = {
 }
 
 
+def _append_ai(text: str, ai_analysis: Optional[str]) -> str:
+    if ai_analysis:
+        return text + f"\n\n*AI Analysis:* {ai_analysis}"
+    return text
+
+
 async def send_checkout_funnel_alert(
     webhook_url: str,
     shop_domain: str,
@@ -29,6 +36,7 @@ async def send_checkout_funnel_alert(
     baseline_rate: float,
     aov: float,
     alert_email: str = None,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     missed = max(0, int(checkouts * baseline_rate) - orders)
     revenue_at_risk = round(missed * aov, 2)
@@ -46,6 +54,7 @@ async def send_checkout_funnel_alert(
         f"• Incident #{incident_id}\n\n"
         f"*Action: Test your checkout NOW at https://{shop_domain}*"
     )
+    text = _append_ai(text, ai_analysis)
     if webhook_url:
         await _post(webhook_url, text)
     if alert_email:
@@ -61,9 +70,10 @@ async def send_silence_alert(
     current_volume: int,
     aov: float,
     alert_email: str = None,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     drop_pct = round((baseline - current_volume) / baseline * 100, 1)
-    revenue_per_hour = round(baseline * 2 * aov, 2)  # baseline is 30-min count
+    revenue_per_hour = round(baseline * 2 * aov, 2)
 
     text = (
         f":warning: *UNUSUAL SILENCE — {shop_domain}*\n"
@@ -75,6 +85,7 @@ async def send_silence_alert(
         f"Possible causes: store down, checkout error, payment failure.\n"
         f"Check https://{shop_domain}"
     )
+    text = _append_ai(text, ai_analysis)
     if webhook_url:
         await _post(webhook_url, text)
     if alert_email:
@@ -92,6 +103,7 @@ async def send_abandonment_alert(
     baseline_rate: float,
     aov: float,
     alert_email: str = None,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     current_pct = round(current_rate * 100, 1)
     baseline_pct = round(baseline_rate * 100, 1)
@@ -107,6 +119,7 @@ async def send_abandonment_alert(
         f"Possible cause: broken checkout step, failed payment method, confusing shipping rates.\n"
         f"Test your checkout: https://{shop_domain}"
     )
+    text = _append_ai(text, ai_analysis)
     if webhook_url:
         await _post(webhook_url, text)
     if alert_email:
@@ -122,6 +135,7 @@ async def send_payment_failure_alert(
     order_names: list,
     total_at_risk: float,
     alert_email: str = None,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     orders_str = ", ".join(order_names)
     if pending_count > 5:
@@ -136,6 +150,7 @@ async def send_payment_failure_alert(
         f"*Action: Check your payment gateway immediately.*\n"
         f"Shopify admin -> Orders -> filter by 'Payment pending'"
     )
+    text = _append_ai(text, ai_analysis)
     if webhook_url:
         await _post(webhook_url, text)
     if alert_email:
@@ -151,6 +166,7 @@ async def send_js_error_alert(
     count_10min: int,
     message: str,
     page_url: str,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     text = (
         f":warning: *JS ERROR SPIKE — {shop_domain}*\n"
@@ -160,6 +176,7 @@ async def send_js_error_alert(
         f"• Incident #{incident_id}\n\n"
         f"This may be causing checkout friction. Check your browser console."
     )
+    text = _append_ai(text, ai_analysis)
     subject = f"[CheckoutGuard] JS Error Spike on {shop_domain}"
     body = text.replace("*", "").replace("`", '"').replace(":warning:", "⚠️")
     if webhook_url:
@@ -177,6 +194,7 @@ async def send_oos_alert(
     orders_last_7d: int,
     revenue_per_hour: float,
     unit_price: float,
+    ai_analysis: Optional[str] = None,
 ) -> None:
     text = (
         f":rotating_light: *HOT PRODUCT OUT OF STOCK — {shop_domain}*\n"
@@ -188,6 +206,7 @@ async def send_oos_alert(
         f"• Incident #{incident_id}\n\n"
         f"*Action: Restock or hide the product until inventory is back.*"
     )
+    text = _append_ai(text, ai_analysis)
     subject = f"[CheckoutGuard] Hot Product Out of Stock: {product_title}"
     body = text.replace("*", "").replace(":rotating_light:", "🚨")
     if webhook_url:
@@ -216,6 +235,48 @@ async def send_recovery_alert(
         await _post(webhook_url, text)
     if alert_email:
         await _send_email(alert_email, subject, body)
+
+
+async def send_weekly_digest(
+    shop_domain: str,
+    to_email: str,
+    checkout_count: int,
+    order_count: int,
+    conversion_rate_pct: float,
+    baseline_rate_pct: float,
+    incident_count: int,
+    estimated_protected_usd: float,
+    ai_summary: Optional[str] = None,
+) -> None:
+    """Weekly digest email — sent every 7 days per merchant."""
+    trend = ""
+    if baseline_rate_pct > 0:
+        delta = conversion_rate_pct - baseline_rate_pct
+        trend = f" ({'+' if delta >= 0 else ''}{delta:.1f}pp vs baseline)"
+
+    if incident_count == 0:
+        status_line = "Your store ran cleanly — no incidents detected this week."
+    else:
+        status_line = f"{incident_count} incident(s) detected this week."
+        if estimated_protected_usd > 0:
+            status_line += f" Estimated revenue protected: ~${estimated_protected_usd:,.0f}."
+
+    intro = ai_summary if ai_summary else status_line
+
+    body = (
+        f"CheckoutGuard Weekly Digest — {shop_domain}\n\n"
+        f"{intro}\n\n"
+        f"Last 7 days:\n"
+        f"  Checkouts started:   {checkout_count}\n"
+        f"  Orders completed:    {order_count}\n"
+        f"  Conversion rate:     {conversion_rate_pct:.1f}%{trend}\n"
+        f"  Incidents:           {incident_count}\n\n"
+        f"— CheckoutGuard\n"
+        f"Manage alerts: https://checkoutguardalerts.com/dashboard?shop={shop_domain}"
+    )
+
+    subject = f"[CheckoutGuard] Weekly digest — {shop_domain}"
+    await _send_email(to_email, subject, body)
 
 
 async def _post(webhook_url: str, text: str) -> None:
