@@ -31,7 +31,7 @@ _MIN_BASELINE_VOLUME = 1.0
 
 # Funnel
 _MIN_CHECKOUTS_FOR_FUNNEL = 5
-_FUNNEL_ALERT_THRESHOLD = 0.50  # alert if conversion < 50% of baseline
+_FUNNEL_ALERT_THRESHOLD = 0.50
 
 # Silence
 _CONSECUTIVE_DROPS_REQUIRED = 3
@@ -44,6 +44,7 @@ _MIN_ABANDONMENTS_FOR_SPIKE = 5
 # Payment
 _PAYMENT_PENDING_MINUTES = 15
 _MIN_PENDING_FOR_ALERT = 3
+_PAYMENT_RECOVERY_CHECKS = 2
 
 
 async def process_event(shop_domain: str, event_type: str = "order_created") -> None:
@@ -145,6 +146,13 @@ async def _check_checkout_funnel(
         missed_orders = max(0, int(checkouts * float(baseline_rate)) - orders)
         revenue_at_risk = round(missed_orders * aov, 2)
 
+        detail = {
+            "checkouts": checkouts,
+            "orders": orders,
+            "current_rate": round(current_rate, 4),
+            "baseline_rate": round(float(baseline_rate), 4),
+        }
+
         incident_id = await conn.fetchval(
             """
             INSERT INTO incidents
@@ -159,16 +167,14 @@ async def _check_checkout_funnel(
             current_rate,
             round(revenue_at_risk / _WINDOW_MINUTES, 2),
             aov,
-            json.dumps({
-                "checkouts": checkouts,
-                "orders": orders,
-                "current_rate": round(current_rate, 4),
-                "baseline_rate": round(float(baseline_rate), 4),
-            }),
+            json.dumps(detail),
         )
         if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_checkout_funnel_alert
+                ai_analysis = await _get_ai_analysis("checkout_funnel_collapse", detail, shop_domain)
+                if ai_analysis:
+                    await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                 await send_checkout_funnel_alert(
                     webhook_url=merchant["slack_webhook_url"],
                     shop_domain=shop_domain,
@@ -179,6 +185,7 @@ async def _check_checkout_funnel(
                     baseline_rate=float(baseline_rate),
                     aov=aov,
                     alert_email=merchant["alert_email"],
+                    ai_analysis=ai_analysis,
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -253,6 +260,8 @@ async def _check_order_silence(
         aov = float(merchant["avg_order_value"])
         rev_loss_per_min = round(max(0.0, baseline - current_volume) / _WINDOW_MINUTES * aov, 2)
 
+        detail = {"drop_pct": round(drop_pct, 1), "baseline": round(float(baseline), 2)}
+
         incident_id = await conn.fetchval(
             """
             INSERT INTO incidents
@@ -265,11 +274,14 @@ async def _check_order_silence(
             shop_domain,
             float(baseline), float(current_volume),
             rev_loss_per_min, aov,
-            json.dumps({"drop_pct": round(drop_pct, 1), "baseline": round(float(baseline), 2)}),
+            json.dumps(detail),
         )
         if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_silence_alert
+                ai_analysis = await _get_ai_analysis("volume_drop", detail, shop_domain)
+                if ai_analysis:
+                    await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                 await send_silence_alert(
                     webhook_url=merchant["slack_webhook_url"],
                     shop_domain=shop_domain,
@@ -278,6 +290,7 @@ async def _check_order_silence(
                     current_volume=current_volume,
                     aov=aov,
                     alert_email=merchant["alert_email"],
+                    ai_analysis=ai_analysis,
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -298,7 +311,6 @@ async def _compute_silence_baseline(
     hour = now.hour
     since = now - timedelta(days=28)
 
-    # Same weekday + hour, last 4 weeks
     total = await conn.fetchval(
         """
         SELECT COUNT(*) FROM checkout_events
@@ -311,9 +323,8 @@ async def _compute_silence_baseline(
     ) or 0
 
     if total > 0:
-        return total / (4 * 6)  # 4 weeks x 6 half-hour slots in 3h window
+        return total / (4 * 6)
 
-    # Fallback: any day, same hour, last 7 days
     total = await conn.fetchval(
         """
         SELECT COUNT(*) FROM checkout_events
@@ -340,7 +351,6 @@ async def _check_abandonment_spike(
     merchant: asyncpg.Record,
     now: datetime,
 ) -> None:
-    # Checkouts created 35-65 min ago with no matching order (give webhook time to arrive)
     abandoned = await conn.fetchval(
         """
         SELECT COUNT(DISTINCT ce.checkout_token) FROM checkout_events ce
@@ -374,7 +384,6 @@ async def _check_abandonment_spike(
 
     current_abandon_rate = abandoned / max(1, checkouts_same_window)
 
-    # Baseline: 7-day average abandonment rate at this hour
     since = now - timedelta(days=_BASELINE_DAYS)
     bl_checkouts = await conn.fetchval(
         """
@@ -383,13 +392,14 @@ async def _check_abandonment_spike(
         """,
         shop_domain, since, now - timedelta(minutes=35),
     ) or 0
+    # Fixed: upper bound matches the same window used for bl_checkouts (excludes last 35 min)
     bl_orders = await conn.fetchval(
         """
         SELECT COUNT(DISTINCT checkout_token) FROM checkout_events
         WHERE shop_domain=$1 AND event_type='order_created'
-          AND created_at >= $2 AND checkout_token IS NOT NULL
+          AND created_at BETWEEN $2 AND $3 AND checkout_token IS NOT NULL
         """,
-        shop_domain, since,
+        shop_domain, since, now - timedelta(minutes=35),
     ) or 0
 
     if bl_checkouts == 0:
@@ -405,6 +415,12 @@ async def _check_abandonment_spike(
 
     if not active and is_spike:
         aov = float(merchant["avg_order_value"])
+        detail = {
+            "abandoned": abandoned,
+            "checkouts": checkouts_same_window,
+            "current_rate": round(current_abandon_rate, 4),
+            "baseline_rate": round(baseline_abandon_rate, 4),
+        }
         incident_id = await conn.fetchval(
             """
             INSERT INTO incidents
@@ -416,16 +432,14 @@ async def _check_abandonment_spike(
             """,
             shop_domain,
             baseline_abandon_rate, current_abandon_rate, aov,
-            json.dumps({
-                "abandoned": abandoned,
-                "checkouts": checkouts_same_window,
-                "current_rate": round(current_abandon_rate, 4),
-                "baseline_rate": round(baseline_abandon_rate, 4),
-            }),
+            json.dumps(detail),
         )
         if merchant["slack_webhook_url"] or merchant["alert_email"]:
             try:
                 from services.alerter import send_abandonment_alert
+                ai_analysis = await _get_ai_analysis("abandonment_spike", detail, shop_domain)
+                if ai_analysis:
+                    await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                 await send_abandonment_alert(
                     webhook_url=merchant["slack_webhook_url"],
                     shop_domain=shop_domain,
@@ -436,6 +450,7 @@ async def _check_abandonment_spike(
                     baseline_rate=baseline_abandon_rate,
                     aov=aov,
                     alert_email=merchant["alert_email"],
+                    ai_analysis=ai_analysis,
                 )
                 await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
             except Exception as exc:
@@ -461,8 +476,6 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                 return
 
             active = await _get_active_incident(conn, shop_domain, "payment_failure")
-            if active:
-                return
 
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=_PAYMENT_PENDING_MINUTES)
         async with httpx.AsyncClient(timeout=15) as client:
@@ -481,11 +494,41 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                 return
             orders = resp.json().get("orders", [])
 
-        if len(orders) < _MIN_PENDING_FOR_ALERT:
+        pending_count = len(orders)
+
+        # If an incident is already open, check for recovery.
+        if active:
+            if pending_count < _MIN_PENDING_FOR_ALERT:
+                # Pending count back below threshold — resolve the incident.
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    now = datetime.now(timezone.utc)
+                    await conn.execute(
+                        "UPDATE incidents SET resolved_at=$1 WHERE id=$2", now, active["id"]
+                    )
+                    if merchant["slack_webhook_url"] or merchant["alert_email"]:
+                        try:
+                            from services.alerter import send_recovery_alert
+                            duration_minutes = int((now - active["started_at"]).total_seconds() / 60)
+                            await send_recovery_alert(
+                                webhook_url=merchant["slack_webhook_url"],
+                                alert_email=merchant["alert_email"],
+                                shop_domain=shop_domain,
+                                incident_id=active["id"],
+                                duration_minutes=duration_minutes,
+                                incident_type="payment_failure",
+                            )
+                        except Exception as exc:
+                            logger.error("Payment failure recovery alert failed: %s", exc)
+            return
+
+        # No active incident — check if we need to create one.
+        if pending_count < _MIN_PENDING_FOR_ALERT:
             return
 
         order_names = [o["name"] for o in orders[:5]]
         total_at_risk = round(sum(float(o.get("total_price", 0)) for o in orders), 2)
+        detail = {"pending_count": pending_count, "total_at_risk": total_at_risk, "order_names": order_names}
 
         async with pool.acquire() as conn:
             incident_id = await conn.fetchval(
@@ -498,19 +541,23 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                 RETURNING id
                 """,
                 shop_domain,
-                json.dumps({"pending_count": len(orders), "total_at_risk": total_at_risk, "order_names": order_names}),
+                json.dumps(detail),
             )
             if merchant["slack_webhook_url"] or merchant["alert_email"]:
                 try:
                     from services.alerter import send_payment_failure_alert
+                    ai_analysis = await _get_ai_analysis("payment_failure", detail, shop_domain)
+                    if ai_analysis:
+                        await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                     await send_payment_failure_alert(
                         webhook_url=merchant["slack_webhook_url"],
                         shop_domain=shop_domain,
                         incident_id=incident_id,
-                        pending_count=len(orders),
+                        pending_count=pending_count,
                         order_names=order_names,
                         total_at_risk=total_at_risk,
                         alert_email=merchant["alert_email"],
+                        ai_analysis=ai_analysis,
                     )
                     await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
                 except Exception as exc:
@@ -523,12 +570,11 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
 # Detector 5: JS error spike (v2)
 # ---------------------------------------------------------------------------
 
-_JS_SPIKE_MIN_COUNT = 10        # occurrences in 10-min window
+_JS_SPIKE_MIN_COUNT = 10
 _JS_SPIKE_WINDOW_MIN = 10
 _JS_RESOLVE_QUIET_MIN = 60
 _JS_RESOLVE_MAX_COUNT = 3
-
-_JS_BASELINE_LOOKBACK_H = 24   # if seen in prior 24h → baseline noise, skip
+_JS_BASELINE_LOOKBACK_H = 24
 
 
 async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
@@ -557,7 +603,6 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
             if count_10min < _JS_SPIKE_MIN_COUNT:
                 return
 
-            # Skip if this error was already present in the 24h before the current window.
             prior_count = await conn.fetchval(
                 """
                 SELECT COUNT(*) FROM js_error_events
@@ -568,23 +613,20 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
             ) or 0
 
             if prior_count > 0:
-                return  # known baseline error, not new
+                return
 
             active = await _get_active_incident(conn, shop_domain, "js_error_spike")
 
-            # Check if same hash is already tracked in an active incident.
             if active:
                 detail = active.get("detail") or {}
                 if isinstance(detail, str):
-                    import json as _json
                     try:
-                        detail = _json.loads(detail)
+                        detail = json.loads(detail)
                     except Exception:
                         detail = {}
                 if detail.get("error_hash") == error_hash:
-                    return  # already open for this hash
+                    return
 
-            # Fetch a sample message for the alert.
             sample = await conn.fetchrow(
                 """
                 SELECT error_message, page_url FROM js_error_events
@@ -596,7 +638,12 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
             message = sample["error_message"] if sample else "unknown"
             page_url = sample["page_url"] if sample else ""
 
-            import json as _json
+            detail = {
+                "error_hash": error_hash,
+                "count_10min": count_10min,
+                "message": message[:200],
+                "page_url": page_url,
+            }
             incident_id = await conn.fetchval(
                 """
                 INSERT INTO incidents
@@ -607,12 +654,7 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
                 RETURNING id
                 """,
                 shop_domain,
-                _json.dumps({
-                    "error_hash": error_hash,
-                    "count_10min": count_10min,
-                    "message": message[:200],
-                    "page_url": page_url,
-                }),
+                json.dumps(detail),
             )
 
             webhook = merchant["slack_webhook_url"]
@@ -620,6 +662,9 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
             if webhook or email:
                 try:
                     from services.alerter import send_js_error_alert
+                    ai_analysis = await _get_ai_analysis("js_error_spike", detail, shop_domain)
+                    if ai_analysis:
+                        await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                     await send_js_error_alert(
                         webhook_url=webhook,
                         alert_email=email,
@@ -628,6 +673,7 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
                         count_10min=count_10min,
                         message=message,
                         page_url=page_url,
+                        ai_analysis=ai_analysis,
                     )
                     await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
                 except Exception as exc:
@@ -637,7 +683,6 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
 
 
 async def _resolve_stale_js_incidents() -> None:
-    """Called from proactive monitor to resolve JS incidents that have gone quiet."""
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
@@ -648,11 +693,10 @@ async def _resolve_stale_js_incidents() -> None:
                 """,
             )
             for row in open_js:
-                import json as _json
                 detail = row["detail"] or {}
                 if isinstance(detail, str):
                     try:
-                        detail = _json.loads(detail)
+                        detail = json.loads(detail)
                     except Exception:
                         continue
                 error_hash = detail.get("error_hash")
@@ -699,7 +743,7 @@ async def _resolve_stale_js_incidents() -> None:
 # Detector 6: OOS hot product (v2, gated by OOS_ENABLED)
 # ---------------------------------------------------------------------------
 
-_OOS_HOT_THRESHOLD = 5   # orders in last 7 days to be "hot"
+_OOS_HOT_THRESHOLD = 5
 _OOS_LOOKBACK_DAYS = 7
 
 
@@ -722,20 +766,17 @@ async def check_oos_hot_product(
             if not merchant or not merchant["active"]:
                 return
 
-            # Look up the product_id from inventory_levels table
             product_id = await conn.fetchval(
                 "SELECT product_id FROM inventory_levels WHERE shop_domain=$1 AND inventory_item_id=$2",
                 shop_domain, inventory_item_id,
             )
 
             if product_id is None:
-                # Can't identify product — can't check line_items
                 return
 
             now = datetime.now(timezone.utc)
             since = now - timedelta(days=_OOS_LOOKBACK_DAYS)
 
-            # Count orders for this product in the last 7 days
             order_count = await conn.fetchval(
                 """
                 SELECT COALESCE(SUM(quantity), 0) FROM order_line_items
@@ -745,9 +786,8 @@ async def check_oos_hot_product(
             ) or 0
 
             if order_count < _OOS_HOT_THRESHOLD:
-                return  # not a hot product
+                return
 
-            # Fetch product title
             product_title = await conn.fetchval(
                 """
                 SELECT product_title FROM order_line_items
@@ -757,7 +797,6 @@ async def check_oos_hot_product(
                 shop_domain, product_id,
             ) or f"product #{product_id}"
 
-            # Fetch product price from most recent line item
             unit_price = await conn.fetchval(
                 """
                 SELECT price FROM order_line_items
@@ -773,7 +812,6 @@ async def check_oos_hot_product(
             revenue_per_hour = round(units_per_hour * float(unit_price), 2)
 
             if available > 0:
-                # Back in stock — resolve any open OOS incident for this product
                 active = await conn.fetchrow(
                     """
                     SELECT id, started_at FROM incidents
@@ -805,7 +843,6 @@ async def check_oos_hot_product(
                             logger.error("OOS recovery alert failed: %s", exc)
                 return
 
-            # available == 0 — check for existing open incident
             already_open = await conn.fetchrow(
                 """
                 SELECT id FROM incidents
@@ -818,7 +855,14 @@ async def check_oos_hot_product(
             if already_open:
                 return
 
-            import json as _json
+            detail = {
+                "product_id": product_id,
+                "product_title": product_title,
+                "inventory_item_id": inventory_item_id,
+                "orders_last_7d": order_count,
+                "estimated_revenue_per_hour": revenue_per_hour,
+                "unit_price": float(unit_price),
+            }
             incident_id = await conn.fetchval(
                 """
                 INSERT INTO incidents
@@ -831,19 +875,15 @@ async def check_oos_hot_product(
                 shop_domain,
                 round(revenue_per_hour / 60, 4),
                 float(unit_price),
-                _json.dumps({
-                    "product_id": product_id,
-                    "product_title": product_title,
-                    "inventory_item_id": inventory_item_id,
-                    "orders_last_7d": order_count,
-                    "estimated_revenue_per_hour": revenue_per_hour,
-                    "unit_price": float(unit_price),
-                }),
+                json.dumps(detail),
             )
 
             if merchant["slack_webhook_url"] or merchant["alert_email"]:
                 try:
                     from services.alerter import send_oos_alert
+                    ai_analysis = await _get_ai_analysis("oos_hot_product", detail, shop_domain)
+                    if ai_analysis:
+                        await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
                     await send_oos_alert(
                         webhook_url=merchant["slack_webhook_url"],
                         alert_email=merchant["alert_email"],
@@ -853,6 +893,7 @@ async def check_oos_hot_product(
                         orders_last_7d=order_count,
                         revenue_per_hour=revenue_per_hour,
                         unit_price=float(unit_price),
+                        ai_analysis=ai_analysis,
                     )
                     await conn.execute("UPDATE incidents SET notified=TRUE WHERE id=$1", incident_id)
                 except Exception as exc:
@@ -870,7 +911,7 @@ async def _get_active_incident(
 ) -> Optional[asyncpg.Record]:
     return await conn.fetchrow(
         """
-        SELECT id, started_at FROM incidents
+        SELECT id, started_at, detail FROM incidents
         WHERE shop_domain=$1 AND incident_type=$2 AND resolved_at IS NULL
         ORDER BY started_at DESC LIMIT 1
         """,
@@ -906,3 +947,19 @@ async def _resolve_incident(
             )
         except Exception as exc:
             logger.error("Recovery alert failed: %s", exc)
+
+
+async def _get_ai_analysis(incident_type: str, detail: dict, shop_domain: str) -> Optional[str]:
+    try:
+        from config import settings
+        from services.ai_analyst import analyze_incident
+        return await analyze_incident(
+            incident_type=incident_type,
+            detail=detail,
+            shop_domain=shop_domain,
+            api_key=settings.anthropic_api_key,
+            enabled=settings.ai_analysis_enabled,
+        )
+    except Exception as exc:
+        logger.warning("AI analysis wrapper error: %s", exc)
+        return None
