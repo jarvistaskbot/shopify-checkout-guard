@@ -105,6 +105,9 @@ async def onboarding_page(request: Request, shop: str = Query(...)) -> HTMLRespo
     />
     <button type="submit">Continue to billing &rarr;</button>
   </form>
+  <p style="margin-top:40px; font-size:13px; color:#999;">
+    Questions? <a href="mailto:artomnats1996@gmail.com" style="color:#008060;">Contact support</a>
+  </p>
 </body>
 </html>"""
     return HTMLResponse(content=html)

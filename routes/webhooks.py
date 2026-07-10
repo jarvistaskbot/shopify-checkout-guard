@@ -146,7 +146,7 @@ async def app_uninstalled(
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE merchants SET active = FALSE WHERE shop_domain = $1",
+            "UPDATE merchants SET active = FALSE, billing_status = 'cancelled' WHERE shop_domain = $1",
             x_shopify_shop_domain,
         )
 

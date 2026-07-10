@@ -39,6 +39,8 @@ h1 { font-size: 22px; margin-bottom: 4px; }
 .banner-ok { background: #e6f4ef; color: #006b45; border: 1px solid #b3d9c9; }
 .banner-warn { background: #fff4e0; color: #7a4e00; border: 1px solid #f5c842; }
 .banner-info { background: #f0f5ff; color: #1a3a6b; border: 1px solid #b3c9f0; }
+.banner-trial { background: #fff8e6; color: #7a4e00; border: 1px solid #f5d87a; font-weight: normal; }
+.banner-subscribe { background: #fff0f0; color: #7a0000; border: 1px solid #f5a0a0; font-weight: normal; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th {
     text-align: left; padding: 10px 12px; background: #f7f7f7;
@@ -118,7 +120,8 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
     pool = await get_pool()
     async with pool.acquire() as conn:
         merchant = await conn.fetchrow(
-            """SELECT shop_domain, installed_at, slack_webhook_url, alert_email
+            """SELECT shop_domain, installed_at, slack_webhook_url, alert_email,
+                      billing_status, trial_ends_at
                FROM merchants WHERE shop_domain = $1 AND active = TRUE""",
             shop,
         )
@@ -164,6 +167,13 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
     if merchant["slack_webhook_url"]:
         slack_masked = "..." + merchant["slack_webhook_url"][-6:]
 
+    from services.billing_guard import get_billing_banner
+    billing_banner = get_billing_banner(
+        merchant["billing_status"],
+        merchant["trial_ends_at"],
+        shop,
+    )
+
     return HTMLResponse(content=_render(
         shop=shop,
         calibrating=calibrating,
@@ -174,6 +184,7 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         order_count=order_count,
         slack_masked=slack_masked,
         alert_email=merchant["alert_email"],
+        billing_banner=billing_banner,
     ))
 
 
@@ -187,6 +198,7 @@ def _render(
     order_count: int,
     slack_masked=None,
     alert_email=None,
+    billing_banner=None,
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -196,11 +208,9 @@ def _render(
 
     # Status banner
     if calibrating:
-        days_left = max(0, 7 - days_active)
         banner_cls = "banner-info"
         banner_text = (
-            f"Calibrating — {days_left} day(s) until baseline is ready. "
-            "Anomaly detection activates once 7 days of data are collected."
+            "Calibrating your store&rsquo;s baseline &mdash; anomaly alerts begin after 7 days."
         )
     elif active_incidents:
         banner_cls = "banner-warn"
@@ -287,6 +297,11 @@ def _render(
         settings_lines.append(f"Email: {escape(alert_email)}")
     settings_summary = " &bull; ".join(settings_lines) if settings_lines else "No alert channels configured."
 
+    billing_banner_html = ""
+    if billing_banner:
+        b_cls, b_text = billing_banner
+        billing_banner_html = f'<div class="banner {b_cls}">{b_text}</div>'
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -298,12 +313,14 @@ def _render(
   <h1>CheckoutGuard Dashboard</h1>
   <p class="sub">Monitoring <span class="shop">{safe_shop}</span></p>
   <div class="banner {banner_cls}">{banner_text}</div>
+  {billing_banner_html}
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
   <p style="margin-top:32px; font-size:13px; color:#999;">
     {settings_summary}<br>
     <a href="/onboarding?shop={safe_shop}">Update alert settings</a>
+    &bull; <a href="mailto:artomnats1996@gmail.com">Support</a>
   </p>
 </body>
 </html>"""

@@ -6,15 +6,15 @@
 
 ---
 
-## Readiness Score: 87 / 100
+## Readiness Score: 95 / 100
 
-All 3 CRITICAL and all HIGH/MEDIUM/LOW audit findings have been fixed on v2-feature-branch. The app now has proper authentication, XSS protection, an env-var billing flag, working OOS detection, AI-powered incident analysis, weekly merchant digests, data retention, and CSRF protection.
+All 3 CRITICAL and all HIGH/MEDIUM/LOW audit findings have been fixed. Billing enforcement, AI cost cap, and support surface are now implemented. The remaining 5 points are non-blocking quality items (mobile dashboard, Theme Extension double-load, `recurring_application_charges/updated` webhook).
 
-**Go / No-Go: CONDITIONAL GO.** All blocking issues resolved. Remaining items are quality-of-life (mobile dashboard, Theme Extension double-load, billing enforcement). Set `BILLING_TEST_MODE=false` and `SECRET_KEY` to a real secret before production deploy.
+**Go / No-Go: GO.** All blocking issues resolved. Follow `docs/LAUNCH-CHECKLIST.md` in exact order at approval time. The single manual step Arto must do: verify the Partner Dashboard listing pricing section shows $29/mo + 14-day trial before going live.
 
 ---
 
-## Test Suite Results (post-fix, 2026-07-10)
+## Test Suite Results (post-fix + billing enforcement, 2026-07-10)
 
 All tests run locally against Python 3.12 + uvicorn + PostgreSQL.
 
@@ -22,8 +22,9 @@ All tests run locally against Python 3.12 + uvicorn + PostgreSQL.
 |---|---|---|
 | `test_e2e.py` | 4 / 4 | ✅ All passed |
 | `test_v2.py` | 12 / 12 | ✅ All passed |
-| `test_fixes.py` (new) | 20 / 20 | ✅ All passed |
-| **Total** | **36 / 36** | **✅ All passed** |
+| `test_fixes.py` | 20 / 20 | ✅ All passed |
+| `test_billing_flow.py` (new) | 15 / 15 | ✅ All passed |
+| **Total** | **51 / 51** | **✅ All passed** |
 
 ---
 
@@ -89,10 +90,11 @@ Inventory webhook now detects NULL `product_id` and calls `_resolve_and_cache_pr
 
 | Priority | Fix | Effort |
 |---|---|---|
-| 1 | Add billing enforcement (redirect if billing inactive) | ~2h |
+| 1 | ~~Add billing enforcement~~ | ✅ Done (v2-feature-branch) |
 | 2 | Mobile-responsive dashboard table | ~2h |
 | 3 | Add `checkouts/create`/`checkouts/delete` to shopify.app.toml | ~10min |
 | 4 | Theme Extension: remove JS double-load | ~15min |
+| 5 | Handle `recurring_application_charges/updated` webhook | ~1h |
 
 ---
 

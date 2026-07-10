@@ -75,7 +75,7 @@ async def _run_realtime_checks(shop_domain: str, event_type: str) -> None:
                 """
                 SELECT alert_threshold_pct, active, drop_streak, recovery_streak,
                        avg_order_value, slack_webhook_url, checkout_conversion_baseline,
-                       alert_email
+                       alert_email, billing_status
                 FROM merchants WHERE shop_domain = $1
                 """,
                 shop_domain,
@@ -169,7 +169,8 @@ async def _check_checkout_funnel(
             aov,
             json.dumps(detail),
         )
-        if merchant["slack_webhook_url"] or merchant["alert_email"]:
+        from services.billing_guard import alerts_allowed
+        if (merchant["slack_webhook_url"] or merchant["alert_email"]) and alerts_allowed(merchant.get("billing_status")):
             try:
                 from services.alerter import send_checkout_funnel_alert
                 ai_analysis = await _get_ai_analysis("checkout_funnel_collapse", detail, shop_domain)
@@ -276,7 +277,8 @@ async def _check_order_silence(
             rev_loss_per_min, aov,
             json.dumps(detail),
         )
-        if merchant["slack_webhook_url"] or merchant["alert_email"]:
+        from services.billing_guard import alerts_allowed as _alerts_allowed
+        if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _alerts_allowed(merchant.get("billing_status")):
             try:
                 from services.alerter import send_silence_alert
                 ai_analysis = await _get_ai_analysis("volume_drop", detail, shop_domain)
@@ -434,7 +436,8 @@ async def _check_abandonment_spike(
             baseline_abandon_rate, current_abandon_rate, aov,
             json.dumps(detail),
         )
-        if merchant["slack_webhook_url"] or merchant["alert_email"]:
+        from services.billing_guard import alerts_allowed as _ba
+        if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _ba(merchant.get("billing_status")):
             try:
                 from services.alerter import send_abandonment_alert
                 ai_analysis = await _get_ai_analysis("abandonment_spike", detail, shop_domain)
@@ -469,7 +472,7 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, alert_email, active FROM merchants WHERE shop_domain=$1",
+                "SELECT slack_webhook_url, alert_email, active, billing_status FROM merchants WHERE shop_domain=$1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
@@ -506,7 +509,8 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                     await conn.execute(
                         "UPDATE incidents SET resolved_at=$1 WHERE id=$2", now, active["id"]
                     )
-                    if merchant["slack_webhook_url"] or merchant["alert_email"]:
+                    from services.billing_guard import alerts_allowed as _pf_ba
+                    if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _pf_ba(merchant.get("billing_status")):
                         try:
                             from services.alerter import send_recovery_alert
                             duration_minutes = int((now - active["started_at"]).total_seconds() / 60)
@@ -543,7 +547,8 @@ async def _check_payment_failures(shop_domain: str, access_token: str) -> None:
                 shop_domain,
                 json.dumps(detail),
             )
-            if merchant["slack_webhook_url"] or merchant["alert_email"]:
+            from services.billing_guard import alerts_allowed as _pf_ba2
+            if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _pf_ba2(merchant.get("billing_status")):
                 try:
                     from services.alerter import send_payment_failure_alert
                     ai_analysis = await _get_ai_analysis("payment_failure", detail, shop_domain)
@@ -582,7 +587,7 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, alert_email, active FROM merchants WHERE shop_domain = $1",
+                "SELECT slack_webhook_url, alert_email, active, billing_status FROM merchants WHERE shop_domain = $1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
@@ -657,9 +662,10 @@ async def check_js_error_spike(shop_domain: str, error_hash: str) -> None:
                 json.dumps(detail),
             )
 
+            from services.billing_guard import alerts_allowed as _js_ba
             webhook = merchant["slack_webhook_url"]
             email = merchant["alert_email"]
-            if webhook or email:
+            if (webhook or email) and _js_ba(merchant.get("billing_status")):
                 try:
                     from services.alerter import send_js_error_alert
                     ai_analysis = await _get_ai_analysis("js_error_spike", detail, shop_domain)
@@ -760,7 +766,7 @@ async def check_oos_hot_product(
     try:
         async with pool.acquire() as conn:
             merchant = await conn.fetchrow(
-                "SELECT slack_webhook_url, alert_email, avg_order_value, active FROM merchants WHERE shop_domain = $1",
+                "SELECT slack_webhook_url, alert_email, avg_order_value, active, billing_status FROM merchants WHERE shop_domain = $1",
                 shop_domain,
             )
             if not merchant or not merchant["active"]:
@@ -825,7 +831,8 @@ async def check_oos_hot_product(
                     await conn.execute(
                         "UPDATE incidents SET resolved_at=NOW() WHERE id=$1", active["id"]
                     )
-                    if merchant["slack_webhook_url"] or merchant["alert_email"]:
+                    from services.billing_guard import alerts_allowed as _oos_ba
+                    if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _oos_ba(merchant.get("billing_status")):
                         try:
                             from services.alerter import send_recovery_alert
                             duration_minutes = int(
@@ -878,7 +885,8 @@ async def check_oos_hot_product(
                 json.dumps(detail),
             )
 
-            if merchant["slack_webhook_url"] or merchant["alert_email"]:
+            from services.billing_guard import alerts_allowed as _oos_ba2
+            if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _oos_ba2(merchant.get("billing_status")):
                 try:
                     from services.alerter import send_oos_alert
                     ai_analysis = await _get_ai_analysis("oos_hot_product", detail, shop_domain)
@@ -953,6 +961,10 @@ async def _get_ai_analysis(incident_type: str, detail: dict, shop_domain: str) -
     try:
         from config import settings
         from services.ai_analyst import analyze_incident
+        from services.billing_guard import consume_ai_budget
+        pool = await get_pool()
+        if not await consume_ai_budget(pool, shop_domain, settings.ai_monthly_call_cap):
+            return None
         return await analyze_incident(
             incident_type=incident_type,
             detail=detail,

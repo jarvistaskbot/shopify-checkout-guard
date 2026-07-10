@@ -170,6 +170,7 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 | `BILLING_TEST_MODE` | No | `False` | If true, Shopify charges are test-mode | `routes/billing.py` — set `false` in production |
 | `AI_ANALYSIS_ENABLED` | No | `True` | Enable Haiku AI incident analysis | `services/ai_analyst.py:analyze_incident` |
 | `ANTHROPIC_API_KEY` | No | `""` | Anthropic API key for Haiku | `services/ai_analyst.py` — leave blank to disable |
+| `AI_MONTHLY_CALL_CAP` | No | `200` | Max AI calls per merchant per month | `services/billing_guard.py:consume_ai_budget` |
 
 > ⚠️ No `SLACK_WEBHOOK_URL` global env — each merchant stores their own webhook URL in the DB.  
 > ⚠️ Set `SECRET_KEY` to a random 32-byte hex string in production — never use the dev default.
@@ -191,13 +192,13 @@ All settings in `config.py` via `pydantic_settings.BaseSettings`. Source: `.env`
 | OOS hot product detector | ✅ v2 built, FIXED | product_id resolved via Shopify API and cached on first webhook |
 | Theme App Extension (JS) | ✅ v2 built | Liquid block + assets/error-tracker.js |
 | Dashboard (server-rendered) | ✅ v2 built, SECURED | HMAC session cookie required; Slack webhook masked; XSS escaped |
-| Billing (Shopify charges) | ✅ built, FIXED | BILLING_TEST_MODE env var (default false); XSS escaped |
+| Billing (Shopify charges) | ✅ built, FIXED, ENFORCED | BILLING_TEST_MODE env var; billing guard suppresses alerts for inactive merchants; trial banner on dashboard |
 | GDPR webhooks | ✅ v1 live | 3 required webhooks implemented |
 | Token refresh | ✅ v1 live | 20-min loop + per-shop Lock prevents race condition |
 | Session auth (HttpOnly cookie) | ✅ v2 built | HMAC-signed, 30-day TTL, SECRET_KEY-derived |
 | CSRF protection | ✅ v2 built | Stateless token derived from session on POST /onboarding |
 | Data retention | ✅ v2 built | Hourly loop purges events >90d, line items >7d, nonces >15min |
-| AI incident analysis (Haiku) | ✅ v2 built | claude-haiku-4-5-20251001, fail-silent, 600-char diagnosis |
+| AI incident analysis (Haiku) | ✅ v2 built | claude-haiku-4-5-20251001, fail-silent, 600-char diagnosis; 200/mo per-merchant cap |
 | Weekly digest email | ✅ v2 built | 7-day stats + optional Haiku summary; hourly check |
 | Multi-plan billing tiers | ❌ planned | Only one plan ($29) exists |
 | Agency / multi-store view | ❌ planned | Not started |

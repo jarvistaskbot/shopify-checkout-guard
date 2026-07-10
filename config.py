@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     # Haiku AI incident analysis
     ai_analysis_enabled: bool = True
     anthropic_api_key: str = ""
+    # Monthly AI call cap per merchant (soft limit — skips call when exceeded)
+    ai_monthly_call_cap: int = 200
 
     model_config = {"env_file": ".env"}
 

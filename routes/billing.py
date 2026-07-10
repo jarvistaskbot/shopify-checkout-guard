@@ -218,7 +218,7 @@ def _error_html(shop: str) -> str:
 <body>
   <h1>Billing setup failed</h1>
   <p class="sub">Could not create a billing charge for <strong>{safe_shop}</strong>.</p>
-  <p class="sub">Please contact <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
+  <p class="sub">Please contact <a href="mailto:artomnats1996@gmail.com">artomnats1996@gmail.com</a></p>
   <p class="sub"><a href="/billing/start?shop={safe_shop}">Retry</a></p>
 </body>
 </html>"""

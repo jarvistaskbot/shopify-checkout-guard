@@ -124,6 +124,7 @@ async def _send_pending_digests() -> None:
             """SELECT shop_domain, alert_email, avg_order_value, installed_at, last_digest_sent_at
                FROM merchants
                WHERE active = TRUE AND alert_email IS NOT NULL
+                 AND billing_status IN ('active', 'pending')
                  AND installed_at <= NOW() - INTERVAL '7 days'
                  AND (last_digest_sent_at IS NULL OR last_digest_sent_at < NOW() - INTERVAL '7 days')"""
         )
