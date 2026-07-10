@@ -32,6 +32,13 @@ API_SECRET = os.environ.get("SHOPIFY_API_SECRET", "")
 SHOP = os.environ.get("TEST_SHOP", "checkoutguard-dev-oxkbbl69.myshopify.com")
 BASE_URL = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
 
+
+def _make_session_cookie(shop: str) -> str:
+    """Create a valid cg_session cookie for test requests."""
+    from config import settings
+    from session import create_session_token
+    return create_session_token(shop, settings.secret_key)
+
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
 
@@ -421,8 +428,13 @@ async def test_order_line_items_persistence(conn, client: httpx.AsyncClient) -> 
 # ---------------------------------------------------------------------------
 
 async def test_dashboard_renders(client: httpx.AsyncClient) -> None:
-    print("\n[10] /dashboard — renders for known shop")
-    r = await client.get(f"{BASE_URL}/dashboard?shop={SHOP}")
+    print("\n[10] /dashboard — renders for known shop with valid session cookie")
+    session_cookie = _make_session_cookie(SHOP)
+    r = await client.get(
+        f"{BASE_URL}/dashboard?shop={SHOP}",
+        cookies={"cg_session": session_cookie},
+        follow_redirects=False,
+    )
     result("/dashboard returns 200", r.status_code == 200, f"got {r.status_code}")
     html = r.text
     result("Contains shop domain", SHOP in html)
@@ -430,9 +442,24 @@ async def test_dashboard_renders(client: httpx.AsyncClient) -> None:
     result("Contains status banner", "banner" in html)
 
 
+async def test_dashboard_no_cookie_redirects(client: httpx.AsyncClient) -> None:
+    print("\n[10b] /dashboard — redirects to OAuth when no session cookie")
+    r = await client.get(
+        f"{BASE_URL}/dashboard?shop={SHOP}",
+        follow_redirects=False,
+    )
+    result("/dashboard without cookie is 302", r.status_code == 302, f"got {r.status_code}")
+    result("Redirects to /auth/shopify", "/auth/shopify" in r.headers.get("location", ""))
+
+
 async def test_dashboard_404_unknown(client: httpx.AsyncClient) -> None:
-    print("\n[11] /dashboard — 404 for unknown shop")
-    r = await client.get(f"{BASE_URL}/dashboard?shop=nobody.myshopify.com")
+    print("\n[11] /dashboard — 404 for unknown shop (with valid cookie for that shop)")
+    session_cookie = _make_session_cookie("nobody.myshopify.com")
+    r = await client.get(
+        f"{BASE_URL}/dashboard?shop=nobody.myshopify.com",
+        cookies={"cg_session": session_cookie},
+        follow_redirects=False,
+    )
     result("/dashboard returns 404 for unknown shop", r.status_code == 404, f"got {r.status_code}")
 
 
@@ -476,6 +503,7 @@ async def main() -> None:
         await test_order_line_items_persistence(conn, client)
         await asyncio.sleep(0.1)
         await test_dashboard_renders(client)
+        await test_dashboard_no_cookie_redirects(client)
         await test_dashboard_404_unknown(client)
 
     await conn.close()
