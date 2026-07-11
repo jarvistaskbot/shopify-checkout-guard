@@ -7,6 +7,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from html import escape
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -121,7 +122,8 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
     async with pool.acquire() as conn:
         merchant = await conn.fetchrow(
             """SELECT shop_domain, installed_at, slack_webhook_url, alert_email,
-                      billing_status, trial_ends_at, plan
+                      billing_status, trial_ends_at, plan,
+                      orders_month, orders_month_reset_at
                FROM merchants WHERE shop_domain = $1 AND active = TRUE""",
             shop,
         )
@@ -168,7 +170,7 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         slack_masked = "..." + merchant["slack_webhook_url"][-6:]
 
     from services.billing_guard import get_billing_banner
-    from services.plans import PLANS
+    from services.plans import PLANS, get_order_cap
     billing_banner = get_billing_banner(
         merchant["billing_status"],
         merchant["trial_ends_at"],
@@ -176,6 +178,17 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
     )
     merchant_plan = merchant["plan"] or "starter"
     plan_name = PLANS.get(merchant_plan, PLANS["starter"])["name"]
+
+    # Determine whether this merchant has exceeded their monthly order cap.
+    order_cap = get_order_cap(merchant_plan)
+    orders_month = merchant["orders_month"] or 0
+    orders_month_reset_at = merchant["orders_month_reset_at"]
+    now = datetime.now(timezone.utc)
+    if orders_month_reset_at is not None and (
+        orders_month_reset_at.year != now.year or orders_month_reset_at.month != now.month
+    ):
+        orders_month = 0  # counter is from a prior month, not yet rolled over
+    order_cap_exceeded = order_cap is not None and orders_month > order_cap
 
     return HTMLResponse(content=_render(
         shop=shop,
@@ -189,6 +202,9 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         alert_email=merchant["alert_email"],
         billing_banner=billing_banner,
         plan_name=plan_name,
+        order_cap_exceeded=order_cap_exceeded,
+        orders_month=orders_month,
+        order_cap=order_cap,
     ))
 
 
@@ -204,6 +220,9 @@ def _render(
     alert_email=None,
     billing_banner=None,
     plan_name: str = "CheckoutGuard Starter",
+    order_cap_exceeded: bool = False,
+    orders_month: int = 0,
+    order_cap: Optional[int] = None,
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -307,6 +326,17 @@ def _render(
         b_cls, b_text = billing_banner
         billing_banner_html = f'<div class="banner {b_cls}">{b_text}</div>'
 
+    order_cap_banner_html = ""
+    if order_cap_exceeded and order_cap is not None:
+        order_cap_banner_html = (
+            f'<div class="banner banner-subscribe">'
+            f"You&rsquo;ve passed <strong>{orders_month:,} orders</strong> this month &mdash; "
+            f"your store has outgrown the {escape(plan_name)} plan ({order_cap:,} order limit). "
+            f"<a href='/billing/plans?shop={safe_shop}'>Upgrade your plan</a> "
+            f"to continue with full coverage. CheckoutGuard keeps monitoring you in the meantime."
+            f"</div>"
+        )
+
     safe_plan = escape(plan_name)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -322,6 +352,7 @@ def _render(
     &bull; <a href="/billing/plans?shop={safe_shop}">Upgrade</a></p>
   <div class="banner {banner_cls}">{banner_text}</div>
   {billing_banner_html}
+  {order_cap_banner_html}
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
