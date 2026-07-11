@@ -22,20 +22,29 @@ import httpx
 
 from config import settings
 from database import get_pool
+from session import create_session_token, COOKIE_NAME
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth")
 
 _SCOPES = "read_orders,read_checkouts"
-
-# In-memory nonce store (per-process; replace with Redis for multi-instance).
-_pending_nonces: set[str] = set()
+_NONCE_TTL_MINUTES = 15
 
 
 @router.get("/shopify")
 async def install(shop: str = Query(..., description="Shopify shop domain")) -> RedirectResponse:
     nonce = secrets.token_urlsafe(16)
-    _pending_nonces.add(nonce)
+
+    # Persist nonce to DB so it survives restarts and multi-instance deployments.
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO pending_nonces (nonce) VALUES ($1) ON CONFLICT DO NOTHING",
+                nonce,
+            )
+    except Exception as exc:
+        logger.error("Failed to store nonce: %s", exc)
 
     callback = f"{settings.app_url}/auth/callback"
     url = (
@@ -44,7 +53,6 @@ async def install(shop: str = Query(..., description="Shopify shop domain")) -> 
         f"&scope={_SCOPES}"
         f"&redirect_uri={callback}"
         f"&state={nonce}"
-        f"&grant_options%5B%5D=offline"
     )
     return RedirectResponse(url)
 
@@ -57,9 +65,16 @@ async def callback(
     hmac_param: str = Query(alias="hmac"),
     request: Request = None,
 ) -> RedirectResponse:
-    if state not in _pending_nonces:
-        raise HTTPException(status_code=400, detail="Invalid state nonce")
-    _pending_nonces.discard(state)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Verify nonce exists in DB and delete atomically.
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=_NONCE_TTL_MINUTES)
+        deleted = await conn.fetchval(
+            "DELETE FROM pending_nonces WHERE nonce=$1 AND created_at > $2 RETURNING nonce",
+            state, cutoff,
+        )
+    if not deleted:
+        raise HTTPException(status_code=400, detail="Invalid or expired state nonce")
 
     # Verify HMAC from Shopify.
     params = dict(request.query_params)
@@ -117,10 +132,33 @@ async def callback(
     asyncio.create_task(_subscribe_webhooks(shop, access_token))
     asyncio.create_task(_fetch_and_store_aov(shop, access_token))
 
-    return RedirectResponse(url=f"/onboarding?shop={shop}")
+    # Determine redirect destination.
+    pool2 = await get_pool()
+    async with pool2.acquire() as conn2:
+        has_config = await conn2.fetchval(
+            "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
+            shop,
+        )
+
+    destination = f"/dashboard?shop={shop}" if has_config else f"/onboarding?shop={shop}"
+
+    # Set signed session cookie and redirect.
+    session_token = create_session_token(shop, settings.secret_key)
+    response = RedirectResponse(url=destination)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=86400 * 30,
+        path="/",
+    )
+    return response
 
 
 async def _subscribe_webhooks(shop: str, access_token: str) -> None:
+    from config import settings as _settings
     topics = [
         ("orders/create", "/webhooks/orders/create"),
         ("app/uninstalled", "/webhooks/app/uninstalled"),
@@ -129,6 +167,8 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
         ("shop/redact", "/webhooks/shop/redact"),
         ("checkouts/create", "/webhooks/checkouts/create"),
         ("checkouts/delete", "/webhooks/checkouts/delete"),
+        # v2: inventory topic (only registers if OOS_ENABLED — requires read_inventory scope granted post-approval)
+        *([("inventory_levels/update", "/webhooks/inventory/update")] if _settings.oos_enabled else []),
     ]
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await client.get(

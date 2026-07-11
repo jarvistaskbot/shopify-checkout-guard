@@ -1,0 +1,6 @@
+api_version = "2024-10"
+
+[[extensions]]
+name = "CheckoutGuard Error Tracker"
+handle = "error-tracker"
+type = "theme_app_extension"
