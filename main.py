@@ -12,6 +12,7 @@ from routes.billing import router as billing_router
 from routes.dashboard import router as dashboard_router
 from routes.events import router as events_router
 from routes.onboarding import router as onboarding_router
+from routes.org import router as org_router
 from routes.webhooks import router as webhook_router
 from services.detector import run_proactive_checks_all_merchants, run_proactive_checks_fast_merchants
 
@@ -183,42 +184,19 @@ async def _send_digest_for_merchant(merchant, now: datetime, pool) -> None:
     baseline_pct = float(merchant.get("avg_order_value") or 50.0)
 
     ai_summary = None
-    if settings.ai_analysis_enabled and settings.anthropic_api_key:
-        try:
-            from services.ai_analyst import analyze_incident
-            detail = {
-                "checkout_count": checkout_count,
-                "order_count": order_count,
-                "conversion_rate_pct": round(conversion_rate_pct, 1),
-                "incident_count": incident_count,
-                "estimated_protected": float(estimated_protected),
-            }
-            # Use a synthetic "digest" incident type for the weekly summary.
-            from services.ai_analyst import _ANTHROPIC_URL, _MODEL, _TIMEOUT
-            import httpx
-            prompt = (
-                f"You are a Shopify expert writing a brief weekly digest for a merchant. "
-                f"Their store {shop} had these metrics last week: "
-                f"{checkout_count} checkouts, {order_count} orders "
-                f"({conversion_rate_pct:.1f}% conversion), {incident_count} incident(s). "
-                f"Write exactly 2 friendly, concise sentences summarizing the week. "
-                f"If incident_count=0, be encouraging. No preamble."
-            )
-            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                resp = await client.post(
-                    _ANTHROPIC_URL,
-                    headers={
-                        "x-api-key": settings.anthropic_api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={"model": _MODEL, "max_tokens": 100,
-                          "messages": [{"role": "user", "content": prompt}]},
-                )
-                if resp.status_code == 200:
-                    ai_summary = resp.json().get("content", [{}])[0].get("text", "").strip()[:300]
-        except Exception as exc:
-            logger.warning("AI digest summary failed for %s: %s", shop, exc)
+    if settings.ai_analysis_enabled and settings.ai_api_key:
+        from services.ai_analyst import generate_text
+        prompt = (
+            f"You are a Shopify expert writing a brief weekly digest for a merchant. "
+            f"Their store {shop} had these metrics last week: "
+            f"{checkout_count} checkouts, {order_count} orders "
+            f"({conversion_rate_pct:.1f}% conversion), {incident_count} incident(s). "
+            f"Write exactly 2 friendly, concise sentences summarizing the week. "
+            f"If incident_count=0, be encouraging. No preamble."
+        )
+        ai_summary = await generate_text(prompt, settings.ai_api_key, max_tokens=100)
+        if ai_summary:
+            ai_summary = ai_summary[:300]
 
     from services.alerter import send_weekly_digest
     await send_weekly_digest(
@@ -277,6 +255,7 @@ app.include_router(billing_router)
 app.include_router(dashboard_router)
 app.include_router(events_router)
 app.include_router(onboarding_router)
+app.include_router(org_router)
 app.include_router(webhook_router)
 
 
