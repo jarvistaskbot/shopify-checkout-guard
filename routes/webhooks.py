@@ -14,6 +14,7 @@ import httpx
 
 from config import settings
 from database import get_pool
+from services.billing_guard import track_order_for_cap
 from services.detector import process_event
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,8 @@ async def order_created(
                 except Exception as exc:
                     logger.warning("line_item insert failed for order %s: %s", order_id, exc)
 
+    pool2 = await get_pool()
+    asyncio.create_task(track_order_for_cap(pool2, x_shopify_shop_domain))
     await process_event(x_shopify_shop_domain, "order_created")
     return {"ok": True}
 
