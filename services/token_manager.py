@@ -52,6 +52,37 @@ async def get_valid_token(
     refresh_tok = row["refresh_token"]
 
     if expires_at is None:
+        # Legacy non-expiring token — Shopify's Admin API rejects these.
+        # Exchange it for an expiring token on first use (irreversible).
+        if access_token.startswith("shpat_"):
+            async with _get_lock(shop):
+                row2 = await conn.fetchrow(
+                    "SELECT access_token, token_expires_at FROM merchants WHERE shop_domain = $1",
+                    shop,
+                )
+                if row2 and row2["token_expires_at"] is not None:
+                    return row2["access_token"]
+                try:
+                    logger.info("Exchanging permanent token for expiring token: %s", shop)
+                    new_token, new_refresh, new_expires_at = await exchange_to_expiring(
+                        shop, access_token, api_key, api_secret
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE merchants
+                        SET access_token = $1, refresh_token = $2, token_expires_at = $3
+                        WHERE shop_domain = $4
+                        """,
+                        new_token,
+                        new_refresh,
+                        new_expires_at,
+                        shop,
+                    )
+                    logger.info("Token exchange complete for %s, expires %s", shop, new_expires_at)
+                    return new_token
+                except Exception as exc:
+                    logger.error("Token exchange failed for %s: %s", shop, exc)
+                    return access_token
         return access_token
 
     now = datetime.now(timezone.utc)

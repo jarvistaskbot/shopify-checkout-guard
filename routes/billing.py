@@ -99,7 +99,13 @@ async def billing_start(
         token = await get_valid_token(
             conn, shop, settings.shopify_api_key, settings.shopify_api_secret
         )
-        if token and token.startswith("shpat_"):
+        # Expiring tokens also use the shpat_ prefix, so the prefix alone says
+        # nothing. Only bypass billing if the token is genuinely non-expiring
+        # (exchange failed) — Shopify's billing API would reject it anyway.
+        expires_at = await conn.fetchval(
+            "SELECT token_expires_at FROM merchants WHERE shop_domain=$1", shop
+        )
+        if token and expires_at is None:
             await conn.execute(
                 """UPDATE merchants
                    SET billing_status='active', billing_activated_at=NOW(), plan=$1
@@ -108,7 +114,7 @@ async def billing_start(
                 shop,
             )
             logger.warning(
-                "Skipped billing for %s — permanent token (plan=%s)", shop, plan
+                "Skipped billing for %s — non-expiring token, exchange failed (plan=%s)", shop, plan
             )
             return RedirectResponse(url=f"/billing/activated?shop={escape(shop)}")
 
