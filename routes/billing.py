@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
 from database import get_pool
+from routes.auth import is_valid_shop_domain
 from services.plans import PLANS
 from services.token_manager import get_valid_token
 from session import COOKIE_NAME, verify_session_token
@@ -222,9 +223,15 @@ async def billing_start(
 @router.get("/callback")
 async def billing_callback(
     request: Request,
-    charge_id: str = Query(...),
-    shop: str = Query(...),
+    charge_id: Optional[str] = Query(default=None),
+    shop: Optional[str] = Query(default=None),
 ) -> HTMLResponse:
+    # Guard against direct/malformed hits (missing params) — never return raw
+    # JSON 422. The real Shopify redirect always carries shop + charge_id.
+    if not shop or not is_valid_shop_domain(shop):
+        return RedirectResponse(url="/", status_code=302)
+    if not charge_id:
+        return RedirectResponse(url=f"/billing/plans?shop={quote(shop)}", status_code=302)
     if not _require_session(request, shop):
         return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
 
