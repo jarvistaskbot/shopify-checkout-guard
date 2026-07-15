@@ -24,6 +24,7 @@ import httpx
 
 from config import settings
 from database import get_pool
+from services.token_manager import get_valid_token
 from session import create_session_token, COOKIE_NAME
 
 logger = logging.getLogger(__name__)
@@ -183,8 +184,10 @@ async def callback(
         )
 
     # Run non-blocking tasks: webhook registration and AOV fetch.
-    asyncio.create_task(_subscribe_webhooks(shop, access_token))
-    asyncio.create_task(_fetch_and_store_aov(shop, access_token))
+    # These fetch a valid (expiring) token themselves — the raw OAuth token is
+    # non-expiring and Shopify's Admin API now rejects it.
+    asyncio.create_task(_subscribe_webhooks(shop))
+    asyncio.create_task(_fetch_and_store_aov(shop))
 
     # Determine redirect destination.
     pool2 = await get_pool()
@@ -222,8 +225,19 @@ async def callback(
     return response
 
 
-async def _subscribe_webhooks(shop: str, access_token: str) -> None:
+async def _subscribe_webhooks(shop: str) -> None:
     from config import settings as _settings
+    # Obtain an expiring token (exchanges the non-expiring OAuth token if needed);
+    # Shopify's Admin API rejects non-expiring tokens for webhook registration.
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            access_token = await get_valid_token(
+                conn, shop, settings.shopify_api_key, settings.shopify_api_secret
+            )
+    except Exception as exc:
+        logger.error("Cannot register webhooks for %s — token unavailable: %s", shop, exc)
+        return
     topics = [
         ("orders/create", "/webhooks/orders/create"),
         ("app/uninstalled", "/webhooks/app/uninstalled"),
@@ -257,9 +271,14 @@ async def _subscribe_webhooks(shop: str, access_token: str) -> None:
                 logger.error("Failed to register %s: %s", topic, resp.text)
 
 
-async def _fetch_and_store_aov(shop: str, access_token: str) -> None:
+async def _fetch_and_store_aov(shop: str) -> None:
     """Fetch recent orders from Shopify and compute real AOV for this merchant."""
     try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            access_token = await get_valid_token(
+                conn, shop, settings.shopify_api_key, settings.shopify_api_secret
+            )
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://{shop}/admin/api/2024-10/orders.json",
