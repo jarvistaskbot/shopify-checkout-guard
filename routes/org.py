@@ -14,6 +14,7 @@ import secrets
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -208,7 +209,7 @@ def _render_org_dashboard(
   <div class="card">
     <h3>Link token</h3>
     <p class="hint">Share this token with another Scale store owner. They enter it on their
-    <a href="/org?shop=their-store.myshopify.com">/org page</a> to join this organization.
+    /org page to join this organization.
     Both stores must have active billing.</p>
     <div class="token-box">{link_token}</div>
   </div>
@@ -236,7 +237,8 @@ async def org_dashboard(request: Request, shop: str = Query(...)) -> HTMLRespons
             shop,
         )
     if not merchant:
-        raise HTTPException(status_code=404, detail="Shop not found or not active")
+        # Unknown/uninstalled shop — restart OAuth instead of a raw JSON 404.
+        return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
 
     merchant_plan = merchant["plan"] or "starter"
     if not plan_allows(merchant_plan, "multi_store"):
@@ -294,7 +296,9 @@ async def org_create(
 
     cookie_val = request.cookies.get(COOKIE_NAME, "")
     if not csrf_token or csrf_token != csrf_token_for(cookie_val, settings.secret_key):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        # Stale/missing CSRF token (e.g. re-submitted old form) — send the user
+        # back to the form so it renders with a fresh token.
+        return RedirectResponse(url=f"/org?shop={quote(shop)}", status_code=302)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -303,7 +307,7 @@ async def org_create(
             shop,
         )
     if not merchant:
-        raise HTTPException(status_code=404)
+        return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
 
     merchant_plan = merchant["plan"] or "starter"
     if not plan_allows(merchant_plan, "multi_store"):
@@ -343,7 +347,9 @@ async def org_join(
 
     cookie_val = request.cookies.get(COOKIE_NAME, "")
     if not csrf_token or csrf_token != csrf_token_for(cookie_val, settings.secret_key):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        # Stale/missing CSRF token — send the user back to the form so it
+        # renders with a fresh token.
+        return RedirectResponse(url=f"/org?shop={quote(shop)}", status_code=302)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -357,7 +363,7 @@ async def org_join(
         )
 
     if not merchant:
-        raise HTTPException(status_code=404)
+        return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
 
     merchant_plan = merchant["plan"] or "starter"
     if not plan_allows(merchant_plan, "multi_store"):

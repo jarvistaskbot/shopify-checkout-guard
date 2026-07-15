@@ -34,10 +34,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 import os
+from config import settings as _settings
 
 SHOP = os.environ.get("TEST_SHOP", "checkoutguard-dev-oxkbbl69.myshopify.com")
 BASE_URL = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
-API_SECRET = os.environ.get("SHOPIFY_API_SECRET", "")
+API_SECRET = os.environ.get("SHOPIFY_API_SECRET") or _settings.shopify_api_secret
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"

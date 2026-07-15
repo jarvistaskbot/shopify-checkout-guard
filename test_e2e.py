@@ -23,7 +23,8 @@ import httpx
 
 # ── config ────────────────────────────────────────────────────────────────────
 import os
-API_SECRET = os.environ.get("SHOPIFY_API_SECRET", "")
+from config import settings as _settings
+API_SECRET = os.environ.get("SHOPIFY_API_SECRET") or _settings.shopify_api_secret
 SHOP = os.environ.get("TEST_SHOP", "checkoutguard-dev-oxkbbl69.myshopify.com")
 BASE_URL = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
 
@@ -122,8 +123,18 @@ async def test_detection_engine(conn) -> None:
     print("\n[3] Detection engine (checkout funnel collapse)")
     import services.detector as det
 
-    # Ensure clean slate
+    # Ensure clean slate — also remove any events left by earlier test functions
+    # (test_event_persistence inserts an order_created in the 30-min window that
+    # would falsely inflate the current conversion rate and prevent incident creation).
     await conn.execute("DELETE FROM incidents WHERE shop_domain = $1", SHOP)
+    await conn.execute(
+        """DELETE FROM checkout_events
+           WHERE shop_domain = $1
+             AND (checkout_token LIKE 'e2e-%' OR checkout_token LIKE 'baseline-tok-%'
+               OR checkout_token LIKE 'recent-tok-%' OR order_id LIKE 'e2e-%'
+               OR order_id LIKE 'test-%')""",
+        SHOP,
+    )
     await conn.execute(
         """UPDATE merchants SET drop_streak=0, recovery_streak=0,
            avg_order_value=100.00, checkout_conversion_baseline=NULL,

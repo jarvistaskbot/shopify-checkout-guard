@@ -1,7 +1,8 @@
 from html import escape
 from typing import Optional
+from urllib.parse import quote
 
-from fastapi import APIRouter, Form, HTTPException, Query, Request
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
@@ -128,7 +129,9 @@ async def onboarding_save(
     cookie_val = request.cookies.get(COOKIE_NAME, "")
     expected_csrf = csrf_token_for(cookie_val, settings.secret_key)
     if not csrf_token or csrf_token != expected_csrf:
-        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        # Stale/missing CSRF token (e.g. re-submitted old form) — send the user
+        # back to the form so it renders with a fresh token.
+        return RedirectResponse(url=f"/onboarding?shop={quote(shop)}", status_code=302)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -260,7 +263,7 @@ async def privacy_policy() -> HTMLResponse:
 
   <h2>Contact</h2>
   <p>For data requests or questions, contact:
-    <a href="mailto:support@checkoutguard.io">support@checkoutguard.io</a></p>
+    <a href="mailto:artomnats1996@gmail.com">artomnats1996@gmail.com</a></p>
 </body>
 </html>"""
     return HTMLResponse(content=html)

@@ -9,9 +9,11 @@ Flow:
 """
 
 import logging
+import math
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Query, Request
@@ -27,6 +29,56 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing")
 
 _TRIAL_DAYS = 14
+
+# Shopify plan names that cannot accept real charges — always use test charges.
+_DEV_SHOP_PLANS = frozenset(
+    {"partner_test", "affiliate", "staff", "staff_business", "plus_partner_sandbox"}
+)
+
+
+async def _charge_is_test(shop: str, token: str) -> bool:
+    """Decide whether the recurring charge must be created with test:true.
+
+    Dev/partner/staff shops cannot accept real charges — Shopify rejects them.
+    Fails open to test:false (a real charge) if shop.json cannot be read.
+    """
+    if settings.billing_test_mode:
+        logger.info("Billing for %s: test charge (billing_test_mode enabled)", shop)
+        return True
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://{shop}/admin/api/2024-10/shop.json",
+                headers={"X-Shopify-Access-Token": token},
+            )
+            resp.raise_for_status()
+            plan_name = (resp.json().get("shop") or {}).get("plan_name") or ""
+    except Exception as exc:
+        logger.warning(
+            "Billing for %s: shop.json lookup failed (%s) — using real charge", shop, exc
+        )
+        return False
+    if plan_name in _DEV_SHOP_PLANS:
+        logger.info("Billing for %s: test charge (dev shop, plan_name=%s)", shop, plan_name)
+        return True
+    logger.info("Billing for %s: real charge (plan_name=%s)", shop, plan_name)
+    return False
+
+
+def _compute_trial_days(
+    trial_ends_at: Optional[datetime],
+    now: Optional[datetime] = None,
+    default_days: int = _TRIAL_DAYS,
+) -> int:
+    """Trial days for a new charge: full trial if never billed, remaining whole
+    days (ceil, min 1) if a trial is still running, 0 if the trial has ended."""
+    if trial_ends_at is None:
+        return default_days
+    now = now or datetime.now(timezone.utc)
+    if trial_ends_at > now:
+        remaining = (trial_ends_at - now).total_seconds() / 86400
+        return max(1, math.ceil(remaining))
+    return 0
 
 
 def _require_session(request: Request, shop: str) -> Optional[str]:
@@ -54,9 +106,16 @@ async def billing_plans(request: Request, shop: str = Query(...)) -> HTMLRespons
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT plan, avg_order_value FROM merchants WHERE shop_domain=$1", shop
+            "SELECT plan, billing_status, avg_order_value FROM merchants WHERE shop_domain=$1",
+            shop,
         )
-        current_plan = (row["plan"] if row else None) or "starter"
+        billing_status = row["billing_status"] if row else None
+        # Only treat a plan as "current" once the merchant has actually gone
+        # through billing — a never-billed merchant has no current plan.
+        if billing_status in ("active", "pending"):
+            current_plan = (row["plan"] if row else None) or "starter"
+        else:
+            current_plan = None
 
         gmv_30d = await conn.fetchval(
             """SELECT COALESCE(SUM(price * quantity), 0)
@@ -99,24 +158,24 @@ async def billing_start(
         token = await get_valid_token(
             conn, shop, settings.shopify_api_key, settings.shopify_api_secret
         )
-        # Expiring tokens also use the shpat_ prefix, so the prefix alone says
-        # nothing. Only bypass billing if the token is genuinely non-expiring
-        # (exchange failed) — Shopify's billing API would reject it anyway.
-        expires_at = await conn.fetchval(
-            "SELECT token_expires_at FROM merchants WHERE shop_domain=$1", shop
+        row = await conn.fetchrow(
+            "SELECT token_expires_at, trial_ends_at FROM merchants WHERE shop_domain=$1",
+            shop,
         )
-        if token and expires_at is None:
-            await conn.execute(
-                """UPDATE merchants
-                   SET billing_status='active', billing_activated_at=NOW(), plan=$1
-                   WHERE shop_domain=$2""",
-                plan,
-                shop,
-            )
-            logger.warning(
-                "Skipped billing for %s — non-expiring token, exchange failed (plan=%s)", shop, plan
-            )
-            return RedirectResponse(url=f"/billing/activated?shop={escape(shop)}")
+
+    if not token or row is None or row["token_expires_at"] is None:
+        # No usable expiring token (exchange failed or merchant missing).
+        # Never activate billing without a real Shopify charge — restart OAuth
+        # to obtain a proper token instead.
+        logger.error(
+            "Billing start for %s aborted — no valid expiring token; restarting OAuth (plan=%s)",
+            shop, plan,
+        )
+        return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
+
+    # Trial re-grant guard: never restart the clock on resubscribe.
+    trial_days = _compute_trial_days(row["trial_ends_at"], default_days=plan_cfg["trial_days"])
+    is_test = await _charge_is_test(shop, token)
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -129,9 +188,9 @@ async def billing_start(
                 "recurring_application_charge": {
                     "name": plan_cfg["name"],
                     "price": str(plan_cfg["price"]),
-                    "return_url": f"{settings.app_url}/billing/callback",
-                    "trial_days": plan_cfg["trial_days"],
-                    "test": settings.billing_test_mode,
+                    "return_url": f"{settings.app_url}/billing/callback?shop={quote(shop)}",
+                    "trial_days": trial_days,
+                    "test": is_test,
                 }
             },
         )
@@ -174,9 +233,11 @@ async def billing_callback(
         token = await get_valid_token(
             conn, shop, settings.shopify_api_key, settings.shopify_api_secret
         )
-        stored_plan = await conn.fetchval(
-            "SELECT plan FROM merchants WHERE shop_domain=$1", shop
-        ) or "starter"
+        m_row = await conn.fetchrow(
+            "SELECT plan, trial_ends_at FROM merchants WHERE shop_domain=$1", shop
+        )
+        stored_plan = (m_row["plan"] if m_row else None) or "starter"
+        existing_trial_ends_at = m_row["trial_ends_at"] if m_row else None
 
     async with httpx.AsyncClient(timeout=15) as client:
         check = await client.get(
@@ -201,7 +262,14 @@ async def billing_callback(
                 charge = activate.json()["recurring_application_charge"]
 
     now = datetime.now(timezone.utc)
-    trial_ends_at = now + timedelta(days=_TRIAL_DAYS) if charge.get("trial_days") else None
+    charge_trial_days = int(charge.get("trial_days") or 0)
+    if existing_trial_ends_at is not None and existing_trial_ends_at <= now:
+        # Trial already granted and expired — never extend it on resubscribe.
+        trial_ends_at = existing_trial_ends_at
+    elif charge_trial_days:
+        trial_ends_at = now + timedelta(days=charge_trial_days)
+    else:
+        trial_ends_at = existing_trial_ends_at
     billing_activated_at = now if charge["status"] in ("active", "pending") else None
 
     pool = await get_pool()
@@ -317,10 +385,10 @@ def _feature_li(label: str, enabled: bool) -> str:
     return f"<li{cls}>{escape(label)}</li>"
 
 
-def _plans_html(safe_shop: str, current_plan: str, recommended: str) -> str:
+def _plans_html(safe_shop: str, current_plan: Optional[str], recommended: str) -> str:
     cards = ""
     for key, cfg in PLANS.items():
-        is_current = key == current_plan
+        is_current = current_plan is not None and key == current_plan
         is_rec = key == recommended and not is_current
 
         card_cls = "plan-card"

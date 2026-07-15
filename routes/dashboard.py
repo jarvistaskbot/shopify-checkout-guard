@@ -5,16 +5,23 @@ Auth: requires valid cg_session HttpOnly cookie (set at OAuth callback).
 
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from html import escape
-from typing import Optional
+from typing import Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from urllib.parse import quote
+
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
 from database import get_pool
-from session import COOKIE_NAME, verify_session_token
+from session import COOKIE_NAME, csrf_token_for, verify_session_token
+
+# In-memory rate limiter for test-alert: maps shop_domain → unix timestamp of last send.
+_test_alert_last_sent: Dict[str, float] = {}
+_TEST_ALERT_COOLDOWN_SECS = 600  # 10 minutes
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -113,7 +120,11 @@ def _fmt_impact(row) -> str:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
+async def dashboard(
+    request: Request,
+    shop: str = Query(...),
+    ta: str = Query(default=""),
+) -> HTMLResponse:
     # Verify session cookie.
     if not _require_session(request, shop):
         return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
@@ -128,7 +139,9 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
             shop,
         )
         if not merchant:
-            raise HTTPException(status_code=404, detail="Shop not found or not active")
+            # Unknown/uninstalled shop (e.g. stale cookie after uninstall) —
+            # restart OAuth instead of showing a raw JSON 404.
+            return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
 
         installed_at = merchant["installed_at"]
         days_active = (datetime.now(timezone.utc) - installed_at).days
@@ -190,6 +203,9 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         orders_month = 0  # counter is from a prior month, not yet rolled over
     order_cap_exceeded = order_cap is not None and orders_month > order_cap
 
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    csrf = csrf_token_for(cookie_val, settings.secret_key)
+
     return HTMLResponse(content=_render(
         shop=shop,
         calibrating=calibrating,
@@ -205,6 +221,8 @@ async def dashboard(request: Request, shop: str = Query(...)) -> HTMLResponse:
         order_cap_exceeded=order_cap_exceeded,
         orders_month=orders_month,
         order_cap=order_cap,
+        csrf_token=csrf,
+        test_alert_status=ta,
     ))
 
 
@@ -223,6 +241,8 @@ def _render(
     order_cap_exceeded: bool = False,
     orders_month: int = 0,
     order_cap: Optional[int] = None,
+    csrf_token: str = "",
+    test_alert_status: str = "",
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -326,6 +346,51 @@ def _render(
         b_cls, b_text = billing_banner
         billing_banner_html = f'<div class="banner {b_cls}">{b_text}</div>'
 
+    # Test-alert result banner
+    test_alert_banner_html = ""
+    if test_alert_status == "sent":
+        test_alert_banner_html = (
+            '<div class="banner banner-ok" style="margin-top:12px;">'
+            'Test alert sent to your Slack channel.'
+            '</div>'
+        )
+    elif test_alert_status == "limit":
+        test_alert_banner_html = (
+            '<div class="banner banner-warn" style="margin-top:12px;">'
+            'Rate limit: please wait 10 minutes between test alerts.'
+            '</div>'
+        )
+    elif test_alert_status == "no_webhook":
+        test_alert_banner_html = (
+            '<div class="banner banner-subscribe" style="margin-top:12px;">'
+            'No Slack webhook configured. '
+            f'<a href="/onboarding?shop={escape(shop)}">Update alert settings</a> first.'
+            '</div>'
+        )
+    elif test_alert_status == "error":
+        test_alert_banner_html = (
+            '<div class="banner banner-subscribe" style="margin-top:12px;">'
+            'Test alert failed — check that your Slack webhook URL is still valid.'
+            '</div>'
+        )
+
+    test_alert_section = f"""
+<div style="margin-top:28px;padding:16px 20px;background:#f7f9ff;border:1px solid #dde5f0;border-radius:8px;">
+  <strong style="font-size:14px;">Test your alert integration</strong>
+  <p style="font-size:13px;color:#666;margin:6px 0 12px;">
+    Send a [TEST] message to your Slack channel to verify the connection.
+  </p>
+  {test_alert_banner_html}
+  <form method="POST" action="/dashboard/test-alert" style="margin-top:8px;">
+    <input type="hidden" name="shop" value="{escape(shop)}" />
+    <input type="hidden" name="csrf_token" value="{escape(csrf_token)}" />
+    <button type="submit"
+      style="padding:8px 18px;background:#008060;color:white;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;">
+      Send test alert
+    </button>
+  </form>
+</div>"""
+
     order_cap_banner_html = ""
     if order_cap_exceeded and order_cap is not None:
         order_cap_banner_html = (
@@ -356,10 +421,54 @@ def _render(
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
-  <p style="margin-top:32px; font-size:13px; color:#999;">
+  {test_alert_section}
+  <p style="margin-top:24px; font-size:13px; color:#999;">
     {settings_summary}<br>
     <a href="/onboarding?shop={safe_shop}">Update alert settings</a>
     &bull; <a href="mailto:artomnats1996@gmail.com">Support</a>
   </p>
 </body>
 </html>"""
+
+
+@router.post("/dashboard/test-alert")
+async def dashboard_test_alert(
+    request: Request,
+    shop: str = Form(...),
+    csrf_token: Optional[str] = Form(default=None),
+) -> RedirectResponse:
+    """Send a [TEST] Slack alert; rate-limited to one per 10 minutes per shop."""
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    expected_csrf = csrf_token_for(cookie_val, settings.secret_key)
+    if not csrf_token or csrf_token != expected_csrf:
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}", status_code=302)
+
+    # Rate limit: one test alert per shop per 10 minutes.
+    now = time.time()
+    last_sent = _test_alert_last_sent.get(shop, 0.0)
+    if now - last_sent < _TEST_ALERT_COOLDOWN_SECS:
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=limit", status_code=303)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT slack_webhook_url FROM merchants WHERE shop_domain=$1 AND active=TRUE",
+            shop,
+        )
+
+    if not row or not row["slack_webhook_url"]:
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=no_webhook", status_code=303)
+
+    # Stamp rate limiter before attempting send so errors also consume the cooldown.
+    _test_alert_last_sent[shop] = now
+    try:
+        from services.alerter import send_test_alert
+        await send_test_alert(row["slack_webhook_url"], shop)
+    except Exception as exc:
+        logger.error("Test alert failed for %s: %s", shop, exc)
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=error", status_code=303)
+
+    return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=sent", status_code=303)

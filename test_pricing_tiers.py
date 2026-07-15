@@ -174,9 +174,11 @@ async def test_billing_start_growth_price(conn) -> None:
         resp.json.return_value = {"recurring_application_charge": charge_data}
         return resp
 
-    # Ensure billing is pending so we can test update
+    # Ensure billing is pending so we can test update; token_expires_at must be non-null
+    # to pass billing_start's expiring-token guard.
     await conn.execute(
-        "UPDATE merchants SET billing_status='inactive', plan='starter' WHERE shop_domain=$1", SHOP
+        "UPDATE merchants SET billing_status='inactive', plan='starter',"
+        " token_expires_at=NOW() + INTERVAL '1 year' WHERE shop_domain=$1", SHOP
     )
 
     with patch("routes.billing.get_valid_token", new=AsyncMock(return_value="shpca_not_partner_token")):
@@ -215,7 +217,8 @@ async def test_billing_start_invalid_plan_defaults_starter(conn) -> None:
         return resp
 
     await conn.execute(
-        "UPDATE merchants SET billing_status='inactive', plan='starter' WHERE shop_domain=$1", SHOP
+        "UPDATE merchants SET billing_status='inactive', plan='starter',"
+        " token_expires_at=NOW() + INTERVAL '1 year' WHERE shop_domain=$1", SHOP
     )
 
     with patch("routes.billing.get_valid_token", new=AsyncMock(return_value="shpca_not_partner_token")):
@@ -251,7 +254,8 @@ async def test_billing_start_scale_price(conn) -> None:
         return resp
 
     await conn.execute(
-        "UPDATE merchants SET billing_status='inactive', plan='starter' WHERE shop_domain=$1", SHOP
+        "UPDATE merchants SET billing_status='inactive', plan='starter',"
+        " token_expires_at=NOW() + INTERVAL '1 year' WHERE shop_domain=$1", SHOP
     )
 
     with patch("routes.billing.get_valid_token", new=AsyncMock(return_value="shpca_not_partner_token")):

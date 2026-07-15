@@ -179,8 +179,8 @@ async def test_org_join(conn, client: httpx.AsyncClient, link_token: str) -> Non
     # Insert a synthetic second merchant row for the join test.
     SHOP_B = "checkoutguard-test-store-b.myshopify.com"
     await conn.execute(
-        """INSERT INTO merchants (shop_domain, active, billing_status, plan)
-           VALUES ($1, TRUE, 'active', 'scale')
+        """INSERT INTO merchants (shop_domain, access_token, active, billing_status, plan)
+           VALUES ($1, 'shpat_test_placeholder', TRUE, 'active', 'scale')
            ON CONFLICT (shop_domain) DO UPDATE
                SET active=TRUE, billing_status='active', plan='scale', organization_id=NULL""",
         SHOP_B,
