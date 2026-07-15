@@ -8,19 +8,24 @@ import hashlib
 import hmac
 import json
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
 import httpx
 
 from config import settings
 from database import get_pool
+from services.billing_guard import track_order_for_cap
 from services.detector import process_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks")
 
 
-async def _verify_hmac(request: Request, x_shopify_hmac_sha256: str) -> bytes:
+async def _verify_hmac(request: Request, x_shopify_hmac_sha256: Optional[str]) -> bytes:
+    if not x_shopify_hmac_sha256:
+        # Missing header is an auth failure (401), not a validation error (422).
+        raise HTTPException(status_code=401, detail="Missing HMAC header")
     body = await request.body()
     digest = base64.b64encode(
         hmac.new(
@@ -34,11 +39,22 @@ async def _verify_hmac(request: Request, x_shopify_hmac_sha256: str) -> bytes:
     return body
 
 
+async def _merchant_is_active(conn, shop_domain: Optional[str]) -> bool:
+    if not shop_domain:
+        return False
+    return bool(
+        await conn.fetchval(
+            "SELECT 1 FROM merchants WHERE shop_domain = $1 AND active = TRUE",
+            shop_domain,
+        )
+    )
+
+
 @router.post("/orders/create")
 async def order_created(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
     payload = json.loads(body)
@@ -46,41 +62,53 @@ async def order_created(
     checkout_token = payload.get("checkout_token", "")
 
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO checkout_events (shop_domain, event_type, checkout_token, order_id)
-            VALUES ($1, 'order_created', $2, $3)
-            """,
-            x_shopify_shop_domain,
-            checkout_token,
-            order_id,
-        )
+    try:
+        async with pool.acquire() as conn:
+            # Skip events for unknown/uninstalled merchants — returning 200
+            # prevents Shopify retry storms on FK violations.
+            if not await _merchant_is_active(conn, x_shopify_shop_domain):
+                logger.debug("orders/create for unknown/inactive shop %s — skipped", x_shopify_shop_domain)
+                return {"ok": True}
 
-        # Store line items for hot-product OOS detection (v2).
-        line_items = payload.get("line_items", [])
-        shopify_order_id = payload.get("id")
-        if shopify_order_id and line_items:
-            for item in line_items:
-                try:
-                    await conn.execute(
-                        """
-                        INSERT INTO order_line_items
-                            (shop_domain, shopify_order_id, product_id, product_title,
-                             variant_id, quantity, price)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        """,
-                        x_shopify_shop_domain,
-                        int(shopify_order_id),
-                        item.get("product_id"),
-                        (item.get("title") or "")[:500],
-                        item.get("variant_id"),
-                        int(item.get("quantity", 1)),
-                        float(item.get("price", 0)) if item.get("price") else None,
-                    )
-                except Exception as exc:
-                    logger.warning("line_item insert failed for order %s: %s", order_id, exc)
+            await conn.execute(
+                """
+                INSERT INTO checkout_events (shop_domain, event_type, checkout_token, order_id)
+                VALUES ($1, 'order_created', $2, $3)
+                """,
+                x_shopify_shop_domain,
+                checkout_token,
+                order_id,
+            )
 
+            # Store line items for hot-product OOS detection (v2).
+            line_items = payload.get("line_items", [])
+            shopify_order_id = payload.get("id")
+            if shopify_order_id and line_items:
+                for item in line_items:
+                    try:
+                        await conn.execute(
+                            """
+                            INSERT INTO order_line_items
+                                (shop_domain, shopify_order_id, product_id, product_title,
+                                 variant_id, quantity, price)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            """,
+                            x_shopify_shop_domain,
+                            int(shopify_order_id),
+                            item.get("product_id"),
+                            (item.get("title") or "")[:500],
+                            item.get("variant_id"),
+                            int(item.get("quantity", 1)),
+                            float(item.get("price", 0)) if item.get("price") else None,
+                        )
+                    except Exception as exc:
+                        logger.warning("line_item insert failed for order %s: %s", order_id, exc)
+    except Exception as exc:
+        logger.error("orders/create insert failed for %s: %s", x_shopify_shop_domain, exc)
+        return {"ok": True}
+
+    pool2 = await get_pool()
+    asyncio.create_task(track_order_for_cap(pool2, x_shopify_shop_domain))
     await process_event(x_shopify_shop_domain, "order_created")
     return {"ok": True}
 
@@ -88,23 +116,31 @@ async def order_created(
 @router.post("/checkouts/create")
 async def checkout_created(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
     payload = json.loads(body)
     checkout_token = payload.get("token", "")
 
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO checkout_events (shop_domain, event_type, checkout_token)
-            VALUES ($1, 'checkout_created', $2)
-            """,
-            x_shopify_shop_domain,
-            checkout_token,
-        )
+    try:
+        async with pool.acquire() as conn:
+            if not await _merchant_is_active(conn, x_shopify_shop_domain):
+                logger.debug("checkouts/create for unknown/inactive shop %s — skipped", x_shopify_shop_domain)
+                return {"ok": True}
+
+            await conn.execute(
+                """
+                INSERT INTO checkout_events (shop_domain, event_type, checkout_token)
+                VALUES ($1, 'checkout_created', $2)
+                """,
+                x_shopify_shop_domain,
+                checkout_token,
+            )
+    except Exception as exc:
+        logger.error("checkouts/create insert failed for %s: %s", x_shopify_shop_domain, exc)
+        return {"ok": True}
 
     await process_event(x_shopify_shop_domain, "checkout_created")
     return {"ok": True}
@@ -113,23 +149,31 @@ async def checkout_created(
 @router.post("/checkouts/delete")
 async def checkout_deleted(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
     payload = json.loads(body)
     checkout_token = payload.get("token", "")
 
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO checkout_events (shop_domain, event_type, checkout_token)
-            VALUES ($1, 'checkout_deleted', $2)
-            """,
-            x_shopify_shop_domain,
-            checkout_token,
-        )
+    try:
+        async with pool.acquire() as conn:
+            if not await _merchant_is_active(conn, x_shopify_shop_domain):
+                logger.debug("checkouts/delete for unknown/inactive shop %s — skipped", x_shopify_shop_domain)
+                return {"ok": True}
+
+            await conn.execute(
+                """
+                INSERT INTO checkout_events (shop_domain, event_type, checkout_token)
+                VALUES ($1, 'checkout_deleted', $2)
+                """,
+                x_shopify_shop_domain,
+                checkout_token,
+            )
+    except Exception as exc:
+        logger.error("checkouts/delete insert failed for %s: %s", x_shopify_shop_domain, exc)
+        return {"ok": True}
 
     await process_event(x_shopify_shop_domain, "checkout_deleted")
     return {"ok": True}
@@ -138,8 +182,8 @@ async def checkout_deleted(
 @router.post("/app/uninstalled")
 async def app_uninstalled(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     await _verify_hmac(request, x_shopify_hmac_sha256)
 
@@ -160,7 +204,7 @@ async def app_uninstalled(
 @router.post("/customers/data_request")
 async def customers_data_request(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
 ) -> dict:
     """Shopify requests what customer data we hold for a given customer."""
     await _verify_hmac(request, x_shopify_hmac_sha256)
@@ -171,7 +215,7 @@ async def customers_data_request(
 @router.post("/customers/redact")
 async def customers_redact(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
 ) -> dict:
     """Shopify requests deletion of customer data."""
     await _verify_hmac(request, x_shopify_hmac_sha256)
@@ -182,8 +226,8 @@ async def customers_redact(
 @router.post("/shop/redact")
 async def shop_redact(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     """Shopify requests permanent deletion of all merchant data (48h after uninstall)."""
     await _verify_hmac(request, x_shopify_hmac_sha256)
@@ -208,8 +252,8 @@ async def shop_redact(
 @router.post("/inventory/update")
 async def inventory_updated(
     request: Request,
-    x_shopify_hmac_sha256: str = Header(...),
-    x_shopify_shop_domain: str = Header(...),
+    x_shopify_hmac_sha256: Optional[str] = Header(default=None),
+    x_shopify_shop_domain: Optional[str] = Header(default=None),
 ) -> dict:
     body = await _verify_hmac(request, x_shopify_hmac_sha256)
     payload = json.loads(body)

@@ -1,5 +1,5 @@
 """
-Haiku AI incident analysis.
+AI incident analysis via OpenRouter (model set in config, default Claude Haiku 4.5).
 Fail-silent: never raises, always returns None on any error.
 """
 
@@ -10,8 +10,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-_MODEL = "claude-haiku-4-5-20251001"
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_MODEL = "anthropic/claude-haiku-4.5"
 _TIMEOUT = 10
 _MAX_CHARS = 600
 
@@ -25,6 +25,35 @@ _INCIDENT_DESCRIPTIONS = {
 }
 
 
+async def generate_text(prompt: str, api_key: str, max_tokens: int = 150) -> Optional[str]:
+    """Single LLM call via OpenRouter. Returns None on any failure."""
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                _OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": _MODEL,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning("OpenRouter returned %d: %s", resp.status_code, resp.text[:200])
+                return None
+            data = resp.json()
+            text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+            return text[:_MAX_CHARS] if text else None
+    except Exception as exc:
+        logger.warning("LLM call failed: %s", exc)
+        return None
+
+
 async def analyze_incident(
     incident_type: str,
     detail: dict,
@@ -32,7 +61,7 @@ async def analyze_incident(
     api_key: str,
     enabled: bool = True,
 ) -> Optional[str]:
-    """Call Haiku to generate a 2-3 sentence diagnosis. Returns None on failure."""
+    """Generate a 2-3 sentence diagnosis. Returns None on failure."""
     if not enabled or not api_key:
         return None
 
@@ -48,30 +77,10 @@ async def analyze_incident(
         f"Be specific and actionable. No preamble."
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.post(
-                _ANTHROPIC_URL,
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": _MODEL,
-                    "max_tokens": 150,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning("Anthropic API returned %d for %s incident", resp.status_code, incident_type)
-                return None
-            data = resp.json()
-            text = data.get("content", [{}])[0].get("text", "").strip()
-            return text[:_MAX_CHARS] if text else None
-    except Exception as exc:
-        logger.warning("AI analysis failed for %s on %s: %s", incident_type, shop_domain, exc)
-        return None
+    result = await generate_text(prompt, api_key)
+    if result is None:
+        logger.warning("AI analysis failed for %s on %s", incident_type, shop_domain)
+    return result
 
 
 def _summarize_detail(incident_type: str, detail: dict) -> str:

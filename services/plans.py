@@ -17,6 +17,7 @@ PLANS = {
         "oos": False,
         "fast_checks": False,
         "ai_cap": 200,
+        "order_cap": 500,
         "custom_thresholds": False,
         "multi_store": False,
     },
@@ -31,6 +32,7 @@ PLANS = {
         "oos": False,
         "fast_checks": False,
         "ai_cap": 200,
+        "order_cap": 5000,
         "custom_thresholds": False,
         "multi_store": False,
     },
@@ -45,6 +47,7 @@ PLANS = {
         "oos": True,
         "fast_checks": True,
         "ai_cap": 200,
+        "order_cap": 20000,
         "custom_thresholds": False,
         "multi_store": False,
     },
@@ -59,6 +62,7 @@ PLANS = {
         "oos": True,
         "fast_checks": True,
         "ai_cap": 1000,
+        "order_cap": None,  # unlimited
         "custom_thresholds": True,
         "multi_store": True,
     },
@@ -75,3 +79,11 @@ def get_ai_cap(merchant_plan: Optional[str]) -> int:
     """Return the monthly AI call cap for the given plan."""
     p = PLANS.get(merchant_plan or "starter", PLANS["starter"])
     return int(p["ai_cap"])
+
+
+def get_order_cap(merchant_plan: Optional[str]) -> Optional[int]:
+    """
+    Return the monthly order cap for the given plan, or None for unlimited (scale).
+    """
+    p = PLANS.get(merchant_plan or "starter", PLANS["starter"])
+    return p.get("order_cap")

@@ -288,10 +288,10 @@ async def test_content_length_bypass(client: httpx.AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. CSRF: POST /onboarding without token → 403
+# 12. CSRF: POST /onboarding without token → redirect (not 403 JSON)
 # ---------------------------------------------------------------------------
 async def test_csrf_missing_token(client: httpx.AsyncClient) -> None:
-    print("\n[12] CSRF: POST /onboarding without csrf_token → 403")
+    print("\n[12] CSRF: POST /onboarding without csrf_token → 302 redirect (not 403 JSON)")
     cookie = _make_session_cookie(SHOP)
     r = await client.post(
         f"{BASE_URL}/onboarding",
@@ -299,7 +299,10 @@ async def test_csrf_missing_token(client: httpx.AsyncClient) -> None:
         cookies={"cg_session": cookie},
         follow_redirects=False,
     )
-    result("Missing CSRF → 403", r.status_code == 403, f"got {r.status_code}")
+    # P1-3 fix: CSRF failure redirects back to the form (not raw 403 JSON).
+    result("Missing CSRF → redirect (302/303)", r.status_code in (302, 303), f"got {r.status_code}")
+    loc = r.headers.get("location", "")
+    result("Redirects to /onboarding", "/onboarding" in loc, f"location: {loc}")
 
 
 # ---------------------------------------------------------------------------

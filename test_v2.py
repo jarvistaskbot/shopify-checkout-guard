@@ -28,7 +28,8 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 import os
-API_SECRET = os.environ.get("SHOPIFY_API_SECRET", "")
+from config import settings as _settings
+API_SECRET = os.environ.get("SHOPIFY_API_SECRET") or _settings.shopify_api_secret
 SHOP = os.environ.get("TEST_SHOP", "checkoutguard-dev-oxkbbl69.myshopify.com")
 BASE_URL = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
 
@@ -453,14 +454,16 @@ async def test_dashboard_no_cookie_redirects(client: httpx.AsyncClient) -> None:
 
 
 async def test_dashboard_404_unknown(client: httpx.AsyncClient) -> None:
-    print("\n[11] /dashboard — 404 for unknown shop (with valid cookie for that shop)")
+    print("\n[11] /dashboard — redirect for unknown shop (P0-E: redirect missing merchant)")
     session_cookie = _make_session_cookie("nobody.myshopify.com")
     r = await client.get(
         f"{BASE_URL}/dashboard?shop=nobody.myshopify.com",
         cookies={"cg_session": session_cookie},
         follow_redirects=False,
     )
-    result("/dashboard returns 404 for unknown shop", r.status_code == 404, f"got {r.status_code}")
+    result("/dashboard redirects for unknown shop (302/303)", r.status_code in (302, 303), f"got {r.status_code}")
+    loc = r.headers.get("location", "")
+    result("Redirects to /auth/shopify", "/auth/shopify" in loc, f"location: {loc}")
 
 
 # ---------------------------------------------------------------------------

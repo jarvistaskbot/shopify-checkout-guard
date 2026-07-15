@@ -1016,7 +1016,7 @@ async def _get_ai_analysis(incident_type: str, detail: dict, shop_domain: str) -
             incident_type=incident_type,
             detail=detail,
             shop_domain=shop_domain,
-            api_key=settings.anthropic_api_key,
+            api_key=settings.ai_api_key,
             enabled=settings.ai_analysis_enabled,
         )
     except Exception as exc:

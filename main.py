@@ -2,16 +2,21 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
+from typing import Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
 from database import create_pool, get_pool
+from routes.auth import is_valid_shop_domain
 from routes.auth import router as auth_router
 from routes.billing import router as billing_router
 from routes.dashboard import router as dashboard_router
 from routes.events import router as events_router
 from routes.onboarding import router as onboarding_router
+from routes.org import router as org_router
 from routes.webhooks import router as webhook_router
 from services.detector import run_proactive_checks_all_merchants, run_proactive_checks_fast_merchants
 
@@ -97,15 +102,21 @@ async def _data_retention_loop() -> None:
                 cutoff_15m = datetime.now(timezone.utc) - timedelta(minutes=15)
 
                 deleted_ce = await conn.fetchval(
-                    "DELETE FROM checkout_events WHERE created_at < $1 RETURNING COUNT(*)",
+                    """WITH del AS (
+                           DELETE FROM checkout_events WHERE created_at < $1 RETURNING 1
+                       ) SELECT COUNT(*) FROM del""",
                     cutoff_90,
                 ) or 0
                 deleted_js = await conn.fetchval(
-                    "DELETE FROM js_error_events WHERE occurred_at < $1 RETURNING COUNT(*)",
+                    """WITH del AS (
+                           DELETE FROM js_error_events WHERE occurred_at < $1 RETURNING 1
+                       ) SELECT COUNT(*) FROM del""",
                     cutoff_90,
                 ) or 0
                 deleted_li = await conn.fetchval(
-                    "DELETE FROM order_line_items WHERE created_at < $1 RETURNING COUNT(*)",
+                    """WITH del AS (
+                           DELETE FROM order_line_items WHERE created_at < $1 RETURNING 1
+                       ) SELECT COUNT(*) FROM del""",
                     cutoff_7,
                 ) or 0
                 # Clean expired nonces.
@@ -180,45 +191,38 @@ async def _send_digest_for_merchant(merchant, now: datetime, pool) -> None:
         ) or 0.0
 
     conversion_rate_pct = (order_count / checkout_count * 100) if checkout_count > 0 else 0.0
-    baseline_pct = float(merchant.get("avg_order_value") or 50.0)
+
+    # Baseline = conversion rate of the week BEFORE this digest window.
+    prev_since = since - timedelta(days=7)
+    async with pool.acquire() as conn:
+        prev_checkouts = await conn.fetchval(
+            """SELECT COUNT(*) FROM checkout_events
+               WHERE shop_domain=$1 AND event_type='checkout_created'
+                 AND created_at >= $2 AND created_at < $3""",
+            shop, prev_since, since,
+        ) or 0
+        prev_orders = await conn.fetchval(
+            """SELECT COUNT(*) FROM checkout_events
+               WHERE shop_domain=$1 AND event_type='order_created'
+                 AND created_at >= $2 AND created_at < $3""",
+            shop, prev_since, since,
+        ) or 0
+    baseline_pct = (prev_orders / prev_checkouts * 100) if prev_checkouts > 0 else 0.0
 
     ai_summary = None
-    if settings.ai_analysis_enabled and settings.anthropic_api_key:
-        try:
-            from services.ai_analyst import analyze_incident
-            detail = {
-                "checkout_count": checkout_count,
-                "order_count": order_count,
-                "conversion_rate_pct": round(conversion_rate_pct, 1),
-                "incident_count": incident_count,
-                "estimated_protected": float(estimated_protected),
-            }
-            # Use a synthetic "digest" incident type for the weekly summary.
-            from services.ai_analyst import _ANTHROPIC_URL, _MODEL, _TIMEOUT
-            import httpx
-            prompt = (
-                f"You are a Shopify expert writing a brief weekly digest for a merchant. "
-                f"Their store {shop} had these metrics last week: "
-                f"{checkout_count} checkouts, {order_count} orders "
-                f"({conversion_rate_pct:.1f}% conversion), {incident_count} incident(s). "
-                f"Write exactly 2 friendly, concise sentences summarizing the week. "
-                f"If incident_count=0, be encouraging. No preamble."
-            )
-            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                resp = await client.post(
-                    _ANTHROPIC_URL,
-                    headers={
-                        "x-api-key": settings.anthropic_api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={"model": _MODEL, "max_tokens": 100,
-                          "messages": [{"role": "user", "content": prompt}]},
-                )
-                if resp.status_code == 200:
-                    ai_summary = resp.json().get("content", [{}])[0].get("text", "").strip()[:300]
-        except Exception as exc:
-            logger.warning("AI digest summary failed for %s: %s", shop, exc)
+    if settings.ai_analysis_enabled and settings.ai_api_key:
+        from services.ai_analyst import generate_text
+        prompt = (
+            f"You are a Shopify expert writing a brief weekly digest for a merchant. "
+            f"Their store {shop} had these metrics last week: "
+            f"{checkout_count} checkouts, {order_count} orders "
+            f"({conversion_rate_pct:.1f}% conversion), {incident_count} incident(s). "
+            f"Write exactly 2 friendly, concise sentences summarizing the week. "
+            f"If incident_count=0, be encouraging. No preamble."
+        )
+        ai_summary = await generate_text(prompt, settings.ai_api_key, max_tokens=100)
+        if ai_summary:
+            ai_summary = ai_summary[:300]
 
     from services.alerter import send_weekly_digest
     await send_weekly_digest(
@@ -244,6 +248,12 @@ async def _send_digest_for_merchant(merchant, now: datetime, pool) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.secret_key == "dev-secret-change-in-prod" and not settings.billing_test_mode:
+        raise RuntimeError(
+            "SECRET_KEY is still the default dev value in a non-test environment. "
+            "Set SECRET_KEY before serving production traffic."
+        )
+
     if settings.database_url:
         for attempt in range(10):
             try:
@@ -277,10 +287,55 @@ app.include_router(billing_router)
 app.include_router(dashboard_router)
 app.include_router(events_router)
 app.include_router(onboarding_router)
+app.include_router(org_router)
 app.include_router(webhook_router)
 
 
-@app.get("/")
+_LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CheckoutGuard</title>
+  <style>
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif;
+        max-width: 560px;
+        margin: 80px auto;
+        padding: 0 20px;
+        color: #1a1a1a;
+    }
+    h1 { font-size: 22px; margin-bottom: 6px; }
+    .sub { color: #666; font-size: 15px; line-height: 1.6; }
+    .brand { color: #008060; }
+    a { color: #008060; }
+  </style>
+</head>
+<body>
+  <h1><span class="brand">CheckoutGuard</span></h1>
+  <p class="sub">
+    CheckoutGuard monitors your Shopify store's checkout funnel around the clock
+    and alerts you in Slack or by email the moment checkout conversion drops,
+    payments start failing, or a hot product sells out &mdash; so silent revenue
+    bleed never goes unnoticed. Install CheckoutGuard from the Shopify App Store
+    to get started.
+  </p>
+  <p class="sub" style="margin-top:32px; font-size:13px; color:#999;">
+    Questions? <a href="mailto:artomnats1996@gmail.com">Contact support</a>
+    &bull; <a href="/privacy">Privacy policy</a>
+  </p>
+</body>
+</html>"""
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "CheckoutGuard"}
+
+
+@app.get("/")
+async def root(shop: Optional[str] = Query(default=None)):
+    # Shopify may open the app root with ?shop=... — forward into OAuth.
+    if shop and is_valid_shop_domain(shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
+    return HTMLResponse(content=_LANDING_HTML)

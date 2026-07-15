@@ -279,6 +279,16 @@ async def send_weekly_digest(
     await _send_email(to_email, subject, body)
 
 
+async def send_test_alert(webhook_url: str, shop_domain: str) -> None:
+    """Send a clearly-labelled [TEST] alert to verify the Slack integration."""
+    text = (
+        f":white_check_mark: *[TEST] CheckoutGuard is connected — {shop_domain}*\n"
+        f"This is a test alert. Your Slack integration is working correctly.\n"
+        f"You will receive real alerts here when CheckoutGuard detects revenue anomalies."
+    )
+    await _post(webhook_url, text)
+
+
 async def _post(webhook_url: str, text: str) -> None:
     if not webhook_url:
         return

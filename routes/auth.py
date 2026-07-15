@@ -13,11 +13,13 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 import httpx
 
 from config import settings
@@ -30,9 +32,47 @@ router = APIRouter(prefix="/auth")
 _SCOPES = "read_orders,read_checkouts"
 _NONCE_TTL_MINUTES = 15
 
+# Valid *.myshopify.com shop domains only (used before echoing shop into URLs).
+SHOP_DOMAIN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$", re.IGNORECASE)
+
+
+def is_valid_shop_domain(shop: str) -> bool:
+    return bool(shop) and bool(SHOP_DOMAIN_RE.match(shop))
+
+
+def _invalid_shop_html() -> str:
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>CheckoutGuard — Invalid shop</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           max-width: 560px; margin: 80px auto; padding: 0 20px; color: #1a1a1a; }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    .sub { color: #666; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <h1>Invalid shop domain</h1>
+  <p class="sub">The <code>shop</code> parameter must be a valid
+  <code>*.myshopify.com</code> domain. Please install CheckoutGuard from the
+  Shopify App Store.</p>
+</body>
+</html>"""
+
+
+def _restart_oauth(shop: str) -> RedirectResponse:
+    """Cleanly restart the OAuth flow for a validated shop domain."""
+    return RedirectResponse(url=f"/auth/shopify?shop={quote(shop)}", status_code=302)
+
 
 @router.get("/shopify")
-async def install(shop: str = Query(..., description="Shopify shop domain")) -> RedirectResponse:
+async def install(shop: str = Query(..., description="Shopify shop domain")) -> Response:
+    if not is_valid_shop_domain(shop):
+        logger.warning("Rejected /auth/shopify with invalid shop param: %r", shop[:100])
+        return HTMLResponse(content=_invalid_shop_html(), status_code=400)
+
     nonce = secrets.token_urlsafe(16)
 
     # Persist nonce to DB so it survives restarts and multi-instance deployments.
@@ -51,7 +91,7 @@ async def install(shop: str = Query(..., description="Shopify shop domain")) -> 
         f"https://{shop}/admin/oauth/authorize"
         f"?client_id={settings.shopify_api_key}"
         f"&scope={_SCOPES}"
-        f"&redirect_uri={callback}"
+        f"&redirect_uri={quote(callback, safe='')}"
         f"&state={nonce}"
     )
     return RedirectResponse(url)
@@ -64,7 +104,12 @@ async def callback(
     state: str = Query(...),
     hmac_param: str = Query(alias="hmac"),
     request: Request = None,
-) -> RedirectResponse:
+) -> Response:
+    # Validate shop before using it in any redirect or URL.
+    if not is_valid_shop_domain(shop):
+        logger.warning("OAuth callback with invalid shop param: %r", shop[:100])
+        return HTMLResponse(content=_invalid_shop_html(), status_code=400)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Verify nonce exists in DB and delete atomically.
@@ -74,7 +119,10 @@ async def callback(
             state, cutoff,
         )
     if not deleted:
-        raise HTTPException(status_code=400, detail="Invalid or expired state nonce")
+        # Back-button / retried callback: nonce already consumed or expired.
+        # Restart OAuth cleanly instead of showing a raw JSON error.
+        logger.info("OAuth callback with missing/expired nonce for %s — restarting OAuth", shop)
+        return _restart_oauth(shop)
 
     # Verify HMAC from Shopify.
     params = dict(request.query_params)
@@ -86,20 +134,26 @@ async def callback(
         hashlib.sha256,
     ).hexdigest()
     if not hmac.compare_digest(digest, hmac_param):
-        raise HTTPException(status_code=403, detail="HMAC verification failed")
+        logger.warning("OAuth callback HMAC mismatch for %s — restarting OAuth", shop)
+        return _restart_oauth(shop)
 
     # Exchange code for access token.
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"https://{shop}/admin/oauth/access_token",
-            json={
-                "client_id": settings.shopify_api_key,
-                "client_secret": settings.shopify_api_secret,
-                "code": code,
-            },
-        )
-        resp.raise_for_status()
-        token_data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://{shop}/admin/oauth/access_token",
+                json={
+                    "client_id": settings.shopify_api_key,
+                    "client_secret": settings.shopify_api_secret,
+                    "code": code,
+                },
+            )
+            resp.raise_for_status()
+            token_data = resp.json()
+    except Exception as exc:
+        # Reused/expired authorization code (e.g. page refresh on the callback).
+        logger.warning("OAuth code exchange failed for %s (%s) — restarting OAuth", shop, exc)
+        return _restart_oauth(shop)
 
     access_token = token_data["access_token"]
     refresh_token = token_data.get("refresh_token")
@@ -135,12 +189,23 @@ async def callback(
     # Determine redirect destination.
     pool2 = await get_pool()
     async with pool2.acquire() as conn2:
-        has_config = await conn2.fetchval(
-            "SELECT slack_webhook_url FROM merchants WHERE shop_domain = $1",
+        row = await conn2.fetchrow(
+            "SELECT slack_webhook_url, billing_status FROM merchants WHERE shop_domain = $1",
             shop,
         )
+    has_config = row["slack_webhook_url"] if row else None
+    billing_status = row["billing_status"] if row else None
 
-    destination = f"/dashboard?shop={shop}" if has_config else f"/onboarding?shop={shop}"
+    # No Slack config yet → onboarding (which forwards to /billing/plans).
+    # Slack configured but billing not active/pending (e.g. reinstall after
+    # uninstall left billing_status='cancelled') → billing plans.
+    # Otherwise → dashboard.
+    if not has_config:
+        destination = f"/onboarding?shop={quote(shop)}"
+    elif billing_status not in ("active", "pending"):
+        destination = f"/billing/plans?shop={quote(shop)}"
+    else:
+        destination = f"/dashboard?shop={quote(shop)}"
 
     # Set signed session cookie and redirect.
     session_token = create_session_token(shop, settings.secret_key)
