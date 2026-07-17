@@ -17,6 +17,7 @@ _INCIDENT_LABELS = {
     "payment_failure": "Payment Gateway Issue",
     "js_error_spike": "JS Error Spike",
     "oos_hot_product": "Hot Product Out of Stock",
+    "slow_bleed": "Slow Checkout Bleed",
 }
 
 
@@ -320,3 +321,38 @@ async def _send_email(to_email: str, subject: str, body: str) -> None:
                 logger.warning("SendGrid returned %d for %s: %s", resp.status_code, to_email, resp.text[:200])
     except Exception as exc:
         logger.error("Email send failed to %s: %s", to_email, exc)
+
+
+async def send_slow_bleed_alert(
+    webhook_url: str,
+    shop_domain: str,
+    incident_id: int,
+    observed: int,
+    expected: float,
+    cusum: float,
+    aov: float,
+    alert_email: str = None,
+    ai_analysis: Optional[str] = None,
+) -> None:
+    """v3 slow-bleed alert: sustained under-expectation checkout-start volume.
+
+    No single window looked alarming — the accumulated shortfall did. Framed
+    accordingly: this is a "check for silent breakage" alert, not an outage."""
+    shortfall_pct = round(max(0.0, 1.0 - (observed / expected)) * 100, 1) if expected else 0.0
+
+    text = (
+        f":small_red_triangle_down: *SLOW CHECKOUT BLEED — {shop_domain}*\n"
+        f"Checkout starts have run persistently below normal for hours\n"
+        f"• Last hour: *{observed}* checkout starts (normal for this hour: ~{expected:.1f})\n"
+        f"• Latest shortfall: *{shortfall_pct}%* under expectation\n"
+        f"• No single hour looked broken — the sustained accumulation did\n"
+        f"• Incident #{incident_id}\n\n"
+        f"*Action: check for silent breakage — recent theme/app changes, discount or "
+        f"shipping misconfig, or a broken product page at https://{shop_domain}*"
+    )
+    text = _append_ai(text, ai_analysis)
+    if webhook_url:
+        await _post(webhook_url, text)
+    if alert_email:
+        subject = f"[CheckoutGuard] Slow Checkout Bleed on {shop_domain}"
+        await _send_email(alert_email, subject, text.replace("*", "").replace(":small_red_triangle_down:", "\u26a0\ufe0f"))

@@ -63,6 +63,7 @@ async def run_proactive_checks_all_merchants() -> None:
                 _check_payment_failures(row["shop_domain"], row["access_token"])
             )
         asyncio.create_task(_resolve_stale_js_incidents())
+        asyncio.create_task(run_slow_bleed_sweep())  # v3: hourly CUSUM (hour-guarded, cheap to re-call)
     except Exception as exc:
         logger.error("Proactive check loop error: %s", exc)
 
@@ -1022,3 +1023,185 @@ async def _get_ai_analysis(incident_type: str, detail: dict, shop_domain: str) -
     except Exception as exc:
         logger.warning("AI analysis wrapper error: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Detector 7: Slow bleed (CUSUM on hourly checkout-start shortfall) — v3
+# ---------------------------------------------------------------------------
+# Single-window thresholds miss slow bleed: 25-35% under baseline never trips a
+# 50% threshold in any window. CUSUM accumulates shortfall across completed
+# hours, so "~30% under expectation for ~6 straight hours" fires even though no
+# single hour looks alarming. Signal is checkout-starts (densest ingested
+# signal); orders stay the slow confirmation. See docs/12-V3-DIRECTION.md §3.
+
+_SB_SLACK = 0.15            # ignore shortfall within 15% of expectation (jitter)
+_SB_ALERT_S = 0.90          # ~30% under for ~6h: 6 x (0.30 - 0.15) = 0.90
+_SB_RESOLVE_S = 0.20        # statistic decayed back to normal -> resolve
+_SB_RECOVERY_DECAY = 0.25   # decay per at/above-expectation hour
+_SB_STAT_CAP = 3.0          # cap so recovery after a long outage isn't endless
+_SB_MIN_EXPECTED = 1.0      # skip hours with expected < 1 checkout-start (too sparse)
+
+
+def _cusum_update(s: float, ratio: float) -> float:
+    """One-sided CUSUM step for one completed hour.
+
+    ratio = observed/expected checkout-starts. Accumulates only the shortfall
+    beyond the slack allowance; decays when the hour was at/above expectation.
+    Pure function so the accumulation math is unit-testable.
+    """
+    if ratio < 1.0 - _SB_SLACK:
+        s += (1.0 - _SB_SLACK) - ratio
+    else:
+        s = max(0.0, s - _SB_RECOVERY_DECAY)
+    return min(s, _SB_STAT_CAP)
+
+
+async def run_slow_bleed_sweep() -> None:
+    """Hourly CUSUM sweep over all active merchants (called from the proactive
+    loop; the per-merchant hour guard makes repeat calls within an hour free)."""
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            merchants = await conn.fetch(
+                """
+                SELECT shop_domain, cusum_stat, cusum_updated_at, avg_order_value,
+                       slack_webhook_url, alert_email, billing_status, plan
+                FROM merchants WHERE active = TRUE
+                """
+            )
+            now = datetime.now(timezone.utc)
+            for m in merchants:
+                try:
+                    await _check_slow_bleed(conn, m["shop_domain"], m, now)
+                except Exception as exc:
+                    logger.error("Slow-bleed check failed for %s: %s", m["shop_domain"], exc)
+    except Exception as exc:
+        logger.error("Slow-bleed sweep error: %s", exc)
+
+
+async def _check_slow_bleed(
+    conn: asyncpg.Connection,
+    shop_domain: str,
+    merchant: asyncpg.Record,
+    now: datetime,
+) -> None:
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    prev_hour_start = hour_start - timedelta(hours=1)
+
+    # Process each completed hour exactly once.
+    last = merchant["cusum_updated_at"]
+    if last is not None and last >= hour_start:
+        return
+
+    expected = await _compute_start_rate_baseline(conn, shop_domain, prev_hour_start)
+    if expected is None or expected < _SB_MIN_EXPECTED:
+        # Too sparse to judge this hour — stamp it processed, leave S unchanged.
+        await conn.execute(
+            "UPDATE merchants SET cusum_updated_at=$1 WHERE shop_domain=$2",
+            hour_start, shop_domain,
+        )
+        return
+
+    observed = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='checkout_created'
+          AND created_at >= $2 AND created_at < $3
+        """,
+        shop_domain, prev_hour_start, hour_start,
+    ) or 0
+
+    ratio = observed / expected
+    s = _cusum_update(float(merchant["cusum_stat"] or 0.0), ratio)
+
+    await conn.execute(
+        "UPDATE merchants SET cusum_stat=$1, cusum_updated_at=$2 WHERE shop_domain=$3",
+        s, hour_start, shop_domain,
+    )
+
+    active = await _get_active_incident(conn, shop_domain, "slow_bleed")
+
+    if not active and s >= _SB_ALERT_S:
+        aov = float(merchant["avg_order_value"] or 0.0)
+        detail = {
+            "cusum": round(s, 2),
+            "last_hour_observed": int(observed),
+            "expected_per_hour": round(float(expected), 2),
+            "last_ratio": round(ratio, 2),
+        }
+        incident_id = await conn.fetchval(
+            """
+            INSERT INTO incidents
+                (shop_domain, checkout_rate_before, checkout_rate_during,
+                 estimated_revenue_loss_per_min, avg_order_value, notified,
+                 incident_type, detail)
+            VALUES ($1, $2, $3, $4, $5, FALSE, 'slow_bleed', $6::jsonb)
+            RETURNING id
+            """,
+            shop_domain,
+            float(expected), float(observed),
+            round(max(0.0, float(expected) - observed) / 60.0 * aov, 2), aov,
+            json.dumps(detail),
+        )
+        from services.billing_guard import alerts_allowed as _alerts_allowed
+        if (merchant["slack_webhook_url"] or merchant["alert_email"]) and _alerts_allowed(merchant.get("billing_status")):
+            try:
+                from services.alerter import send_slow_bleed_alert
+                ai_analysis = await _get_ai_analysis("slow_bleed", detail, shop_domain)
+                if ai_analysis:
+                    await conn.execute("UPDATE incidents SET ai_analysis=$1 WHERE id=$2", ai_analysis, incident_id)
+                await send_slow_bleed_alert(
+                    webhook_url=merchant["slack_webhook_url"],
+                    shop_domain=shop_domain,
+                    incident_id=incident_id,
+                    observed=int(observed),
+                    expected=float(expected),
+                    cusum=s,
+                    aov=aov,
+                    alert_email=merchant["alert_email"],
+                    ai_analysis=ai_analysis,
+                )
+                await conn.execute("UPDATE incidents SET notified = TRUE WHERE id = $1", incident_id)
+            except Exception as exc:
+                logger.error("Slow-bleed alert failed: %s", exc)
+
+    elif active and s <= _SB_RESOLVE_S:
+        await _resolve_incident(conn, shop_domain, active, now, merchant)
+
+
+async def _compute_start_rate_baseline(
+    conn: asyncpg.Connection, shop_domain: str, hour_dt: datetime
+) -> Optional[float]:
+    """Expected checkout-starts for the hour beginning at hour_dt: 28-day
+    same-weekday +-1h band (like the silence baseline), 7-day hour-band fallback.
+    Divides by the ACTUAL band width so midnight/23:00 edges aren't inflated."""
+    # Postgres EXTRACT(DOW) is 0=Sunday..6=Saturday; Python weekday() is
+    # 0=Monday..6=Sunday — convert, or the weekday match is shifted by one day.
+    weekday = (hour_dt.weekday() + 1) % 7
+    hour = hour_dt.hour
+    lo, hi = max(0, hour - 1), min(23, hour + 1)
+    band_hours = hi - lo + 1
+
+    total = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='checkout_created' AND created_at>=$2
+          AND EXTRACT(DOW FROM created_at AT TIME ZONE 'UTC')=$3
+          AND EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC') BETWEEN $4 AND $5
+        """,
+        shop_domain, hour_dt - timedelta(days=28), weekday, lo, hi,
+    ) or 0
+    if total > 0:
+        return total / (4 * band_hours)
+
+    total = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM checkout_events
+        WHERE shop_domain=$1 AND event_type='checkout_created' AND created_at>=$2
+          AND EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC') BETWEEN $3 AND $4
+        """,
+        shop_domain, hour_dt - timedelta(days=_BASELINE_DAYS), lo, hi,
+    ) or 0
+    if total == 0:
+        return None
+    return total / (_BASELINE_DAYS * band_hours)
