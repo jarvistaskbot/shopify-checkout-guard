@@ -106,6 +106,13 @@ async def onboarding_page(request: Request, shop: str = Query(...)) -> HTMLRespo
     />
     <button type="submit">Continue to billing &rarr;</button>
   </form>
+  <form method="POST" action="/onboarding/skip" style="margin-top:12px;">
+    <input type="hidden" name="shop" value="{safe_shop}" />
+    <input type="hidden" name="csrf_token" value="{csrf}" />
+    <button type="submit" style="background:none;border:none;color:#888;font-size:13px;cursor:pointer;padding:0;text-decoration:underline;">
+      Skip for now &mdash; you can connect Slack later from the dashboard
+    </button>
+  </form>
   <p style="margin-top:40px; font-size:13px; color:#999;">
     Questions? <a href="mailto:artomnats1996@gmail.com" style="color:#008060;">Contact support</a>
   </p>
@@ -136,9 +143,32 @@ async def onboarding_save(
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE merchants SET slack_webhook_url = $1, alert_email = $2 WHERE shop_domain = $3",
+            "UPDATE merchants SET slack_webhook_url = $1, alert_email = $2, onboarding_seen = TRUE WHERE shop_domain = $3",
             slack_webhook_url,
             alert_email or None,
+            shop,
+        )
+    return RedirectResponse(url=f"/billing/plans?shop={escape(shop)}", status_code=303)
+
+
+@router.post("/onboarding/skip")
+async def onboarding_skip(
+    request: Request,
+    shop: str = Form(...),
+    csrf_token: Optional[str] = Form(default=None),
+) -> RedirectResponse:
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    expected_csrf = csrf_token_for(cookie_val, settings.secret_key)
+    if not csrf_token or csrf_token != expected_csrf:
+        return RedirectResponse(url=f"/onboarding?shop={quote(shop)}", status_code=302)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE merchants SET onboarding_seen = TRUE WHERE shop_domain = $1",
             shop,
         )
     return RedirectResponse(url=f"/billing/plans?shop={escape(shop)}", status_code=303)

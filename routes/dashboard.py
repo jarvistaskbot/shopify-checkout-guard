@@ -341,6 +341,15 @@ def _render(
         settings_lines.append(f"Email: {escape(alert_email)}")
     settings_summary = " &bull; ".join(settings_lines) if settings_lines else "No alert channels configured."
 
+    slack_missing_banner_html = ""
+    if not slack_masked:
+        slack_missing_banner_html = (
+            f'<div class="banner banner-warn">'
+            f'Slack is not connected &mdash; alerts cannot be delivered yet. '
+            f'<a href="/onboarding?shop={safe_shop}" style="color:#7a4e00;">Connect Slack</a>'
+            f'</div>'
+        )
+
     billing_banner_html = ""
     if billing_banner:
         b_cls, b_text = billing_banner
@@ -416,6 +425,7 @@ def _render(
     &bull; Plan: <strong>{safe_plan}</strong>
     &bull; <a href="/billing/plans?shop={safe_shop}">Upgrade</a></p>
   <div class="banner {banner_cls}">{banner_text}</div>
+  {slack_missing_banner_html}
   {billing_banner_html}
   {order_cap_banner_html}
   {stats_html}

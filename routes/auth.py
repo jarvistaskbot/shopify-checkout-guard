@@ -193,17 +193,19 @@ async def callback(
     pool2 = await get_pool()
     async with pool2.acquire() as conn2:
         row = await conn2.fetchrow(
-            "SELECT slack_webhook_url, billing_status FROM merchants WHERE shop_domain = $1",
+            "SELECT slack_webhook_url, billing_status, onboarding_seen FROM merchants WHERE shop_domain = $1",
             shop,
         )
     has_config = row["slack_webhook_url"] if row else None
     billing_status = row["billing_status"] if row else None
+    onboarding_seen = row["onboarding_seen"] if row else False
 
-    # No Slack config yet → onboarding (which forwards to /billing/plans).
-    # Slack configured but billing not active/pending (e.g. reinstall after
-    # uninstall left billing_status='cancelled') → billing plans.
+    # No Slack config and onboarding not yet seen → onboarding (which forwards
+    # to /billing/plans). Merchants who skipped onboarding bypass this step.
+    # Slack configured (or onboarding seen) but billing not active/pending
+    # (e.g. reinstall after uninstall left billing_status='cancelled') → billing plans.
     # Otherwise → dashboard.
-    if not has_config:
+    if not has_config and not onboarding_seen:
         destination = f"/onboarding?shop={quote(shop)}"
     elif billing_status not in ("active", "pending"):
         destination = f"/billing/plans?shop={quote(shop)}"
