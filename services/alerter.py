@@ -57,7 +57,7 @@ async def send_checkout_funnel_alert(
     )
     text = _append_ai(text, ai_analysis)
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="checkout_funnel_collapse", incident_id=incident_id)
     if alert_email:
         subject = f"[CheckoutGuard] Checkout Broken on {shop_domain}"
         await _send_email(alert_email, subject, text.replace("*", "").replace(":rotating_light:", "🚨"))
@@ -88,7 +88,7 @@ async def send_silence_alert(
     )
     text = _append_ai(text, ai_analysis)
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="volume_drop", incident_id=incident_id)
     if alert_email:
         subject = f"[CheckoutGuard] Unusual Silence on {shop_domain}"
         await _send_email(alert_email, subject, text.replace("*", "").replace(":warning:", "⚠️"))
@@ -122,7 +122,7 @@ async def send_abandonment_alert(
     )
     text = _append_ai(text, ai_analysis)
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="abandonment_spike", incident_id=incident_id)
     if alert_email:
         subject = f"[CheckoutGuard] Abandonment Spike on {shop_domain}"
         await _send_email(alert_email, subject, text.replace("*", "").replace(":warning:", "⚠️"))
@@ -153,7 +153,7 @@ async def send_payment_failure_alert(
     )
     text = _append_ai(text, ai_analysis)
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="payment_failure", incident_id=incident_id)
     if alert_email:
         subject = f"[CheckoutGuard] Payment Gateway Issue on {shop_domain}"
         await _send_email(alert_email, subject, text.replace("*", "").replace(":rotating_light:", "🚨"))
@@ -181,7 +181,7 @@ async def send_js_error_alert(
     subject = f"[CheckoutGuard] JS Error Spike on {shop_domain}"
     body = text.replace("*", "").replace("`", '"').replace(":warning:", "⚠️")
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="js_error_spike", incident_id=incident_id)
     if alert_email:
         await _send_email(alert_email, subject, body)
 
@@ -211,7 +211,7 @@ async def send_oos_alert(
     subject = f"[CheckoutGuard] Hot Product Out of Stock: {product_title}"
     body = text.replace("*", "").replace(":rotating_light:", "🚨")
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="oos_hot_product", incident_id=incident_id)
     if alert_email:
         await _send_email(alert_email, subject, body)
 
@@ -233,7 +233,7 @@ async def send_recovery_alert(
     subject = f"[CheckoutGuard] Resolved: {label} on {shop_domain}"
     body = text.replace("*", "").replace(":white_check_mark:", "✅")
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="recovery", incident_id=incident_id)
     if alert_email:
         await _send_email(alert_email, subject, body)
 
@@ -287,15 +287,51 @@ async def send_test_alert(webhook_url: str, shop_domain: str) -> None:
         f"This is a test alert. Your Slack integration is working correctly.\n"
         f"You will receive real alerts here when CheckoutGuard detects revenue anomalies."
     )
-    await _post(webhook_url, text)
+    await _post(webhook_url, text, shop_domain=shop_domain, alert_type="test")
 
 
-async def _post(webhook_url: str, text: str) -> None:
+async def _record_delivery(
+    shop_domain: Optional[str],
+    alert_type: Optional[str],
+    incident_id: Optional[int],
+    success: bool,
+    status_detail: str,
+) -> None:
+    """Persist an alert delivery attempt. Never raises — history recording
+    must not break alert delivery or the detection loop."""
+    if not shop_domain:
+        return
+    try:
+        from database import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO alert_deliveries
+                       (shop_domain, alert_type, incident_id, success, status_detail)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                shop_domain, alert_type or "unknown", incident_id, success, status_detail[:200],
+            )
+    except Exception as exc:
+        logger.warning("Failed to record alert delivery for %s: %s", shop_domain, exc)
+
+
+async def _post(
+    webhook_url: str,
+    text: str,
+    shop_domain: Optional[str] = None,
+    alert_type: Optional[str] = None,
+    incident_id: Optional[int] = None,
+) -> None:
     if not webhook_url:
         return
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(webhook_url, json={"text": text})
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(webhook_url, json={"text": text})
+            resp.raise_for_status()
+    except Exception as exc:
+        await _record_delivery(shop_domain, alert_type, incident_id, False, str(exc))
+        raise
+    await _record_delivery(shop_domain, alert_type, incident_id, True, "delivered")
 
 
 async def _send_email(to_email: str, subject: str, body: str) -> None:
@@ -352,7 +388,7 @@ async def send_slow_bleed_alert(
     )
     text = _append_ai(text, ai_analysis)
     if webhook_url:
-        await _post(webhook_url, text)
+        await _post(webhook_url, text, shop_domain=shop_domain, alert_type="slow_bleed", incident_id=incident_id)
     if alert_email:
         subject = f"[CheckoutGuard] Slow Checkout Bleed on {shop_domain}"
         await _send_email(alert_email, subject, text.replace("*", "").replace(":small_red_triangle_down:", "\u26a0\ufe0f"))

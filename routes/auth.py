@@ -240,12 +240,13 @@ async def _subscribe_webhooks(shop: str) -> None:
     except Exception as exc:
         logger.error("Cannot register webhooks for %s — token unavailable: %s", shop, exc)
         return
+    # GDPR compliance topics (customers/data_request, customers/redact,
+    # shop/redact) are intentionally absent: Shopify rejects them via the
+    # Admin API — they must be configured as compliance webhooks in the
+    # Partner Dashboard. The HTTP endpoints for them remain in routes/webhooks.
     topics = [
         ("orders/create", "/webhooks/orders/create"),
         ("app/uninstalled", "/webhooks/app/uninstalled"),
-        ("customers/data_request", "/webhooks/customers/data_request"),
-        ("customers/redact", "/webhooks/customers/redact"),
-        ("shop/redact", "/webhooks/shop/redact"),
         ("checkouts/create", "/webhooks/checkouts/create"),
         ("checkouts/delete", "/webhooks/checkouts/delete"),
         # v2: inventory topic (only registers if OOS_ENABLED — requires read_inventory scope granted post-approval)

@@ -220,11 +220,14 @@ async def test_test_alert_no_webhook(client: httpx.AsyncClient, conn) -> None:
 # 10. Test-alert: rate limiter implementation check (unit)
 # ---------------------------------------------------------------------------
 def test_test_alert_rate_limit_implementation() -> None:
-    print("\n[10] Test-alert: rate limiter is implemented with 10-min cooldown")
+    print("\n[10] Test-alert: rate limiter is implemented with 60s cooldown")
     from routes.dashboard import _TEST_ALERT_COOLDOWN_SECS
+    # 60s protects the Slack webhook without blocking a reviewer or merchant
+    # who clicks the button several times while exploring the dashboard
+    # (the old 600s cooldown refused a Shopify reviewer mid-review).
     result(
-        "Cooldown constant is 600s (10 min)",
-        _TEST_ALERT_COOLDOWN_SECS == 600,
+        "Cooldown constant is 60s",
+        _TEST_ALERT_COOLDOWN_SECS == 60,
         f"got {_TEST_ALERT_COOLDOWN_SECS}",
     )
     import inspect

@@ -21,7 +21,7 @@ from session import COOKIE_NAME, csrf_token_for, verify_session_token
 
 # In-memory rate limiter for test-alert: maps shop_domain → unix timestamp of last send.
 _test_alert_last_sent: Dict[str, float] = {}
-_TEST_ALERT_COOLDOWN_SECS = 600  # 10 minutes
+_TEST_ALERT_COOLDOWN_SECS = 60
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -82,6 +82,13 @@ _INCIDENT_LABELS = {
     "payment_failure": "Payment Gateway",
     "js_error_spike": "JS Error Spike",
     "oos_hot_product": "Out-of-Stock Alert",
+    "slow_bleed": "Slow Checkout Bleed",
+}
+
+_ALERT_TYPE_LABELS = {
+    **_INCIDENT_LABELS,
+    "test": "Test Alert",
+    "recovery": "Incident Resolved",
 }
 
 
@@ -124,6 +131,7 @@ async def dashboard(
     request: Request,
     shop: str = Query(...),
     ta: str = Query(default=""),
+    w: int = Query(default=0),
 ) -> HTMLResponse:
     # Verify session cookie.
     if not _require_session(request, shop):
@@ -177,6 +185,13 @@ async def dashboard(
             shop, since,
         ) or 0
 
+        recent_alerts = await conn.fetch(
+            """SELECT alert_type, incident_id, sent_at, success, status_detail
+               FROM alert_deliveries WHERE shop_domain = $1
+               ORDER BY sent_at DESC LIMIT 10""",
+            shop,
+        )
+
     # Mask Slack webhook URL — show only last 6 chars, never the full URL.
     slack_masked = None
     if merchant["slack_webhook_url"]:
@@ -223,6 +238,8 @@ async def dashboard(
         order_cap=order_cap,
         csrf_token=csrf,
         test_alert_status=ta,
+        test_alert_wait_secs=w,
+        recent_alerts=list(recent_alerts),
     ))
 
 
@@ -243,6 +260,8 @@ def _render(
     order_cap: Optional[int] = None,
     csrf_token: str = "",
     test_alert_status: str = "",
+    test_alert_wait_secs: int = 0,
+    recent_alerts: Optional[list] = None,
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -364,9 +383,10 @@ def _render(
             '</div>'
         )
     elif test_alert_status == "limit":
+        wait_secs = test_alert_wait_secs if test_alert_wait_secs > 0 else 60
         test_alert_banner_html = (
             '<div class="banner banner-warn" style="margin-top:12px;">'
-            'Rate limit: please wait 10 minutes between test alerts.'
+            f'Rate limit reached &mdash; you can send another test alert in about {wait_secs} seconds.'
             '</div>'
         )
     elif test_alert_status == "no_webhook":
@@ -400,6 +420,42 @@ def _render(
   </form>
 </div>"""
 
+    # Recent alerts (delivery history) — lets anyone verify alert delivery
+    # from inside the app, without access to the receiving Slack workspace.
+    if recent_alerts:
+        alert_rows = ""
+        for a in recent_alerts:
+            type_label = _ALERT_TYPE_LABELS.get(
+                a["alert_type"], a["alert_type"].replace("_", " ").title()
+            )
+            if a["success"]:
+                delivery = '<span class="badge badge-resolved">Delivered to Slack</span>'
+            else:
+                detail = escape((a["status_detail"] or "delivery failed")[:80])
+                delivery = f'<span class="badge badge-active" title="{detail}">Failed</span>'
+            incident_ref = f'#{a["incident_id"]}' if a["incident_id"] else "&mdash;"
+            alert_rows += f"""
+<tr>
+  <td>{_fmt_dt(a["sent_at"])}</td>
+  <td>{type_label}</td>
+  <td>{incident_ref}</td>
+  <td>{delivery}</td>
+</tr>"""
+        recent_alerts_html = f"""
+<h2>Recent Alerts</h2>
+<table>
+  <thead>
+    <tr><th>Sent</th><th>Type</th><th>Incident</th><th>Delivery</th></tr>
+  </thead>
+  <tbody>{alert_rows}</tbody>
+</table>"""
+    else:
+        recent_alerts_html = (
+            '<h2>Recent Alerts</h2>'
+            '<p class="empty">No alerts sent yet &mdash; press &ldquo;Send test alert&rdquo; '
+            'below and it will appear here with its delivery status.</p>'
+        )
+
     order_cap_banner_html = ""
     if order_cap_exceeded and order_cap is not None:
         order_cap_banner_html = (
@@ -431,6 +487,7 @@ def _render(
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
+  {recent_alerts_html}
   {test_alert_section}
   <p style="margin-top:24px; font-size:13px; color:#999;">
     {settings_summary}<br>
@@ -456,11 +513,14 @@ async def dashboard_test_alert(
     if not csrf_token or csrf_token != expected_csrf:
         return RedirectResponse(url=f"/dashboard?shop={quote(shop)}", status_code=302)
 
-    # Rate limit: one test alert per shop per 10 minutes.
+    # Rate limit: one test alert per shop per cooldown window.
     now = time.time()
     last_sent = _test_alert_last_sent.get(shop, 0.0)
     if now - last_sent < _TEST_ALERT_COOLDOWN_SECS:
-        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=limit", status_code=303)
+        remaining = max(1, int(_TEST_ALERT_COOLDOWN_SECS - (now - last_sent)))
+        return RedirectResponse(
+            url=f"/dashboard?shop={quote(shop)}&ta=limit&w={remaining}", status_code=303
+        )
 
     pool = await get_pool()
     async with pool.acquire() as conn:
