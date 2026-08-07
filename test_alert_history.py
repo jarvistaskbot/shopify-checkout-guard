@@ -178,6 +178,37 @@ async def test_5_empty_state(client, conn) -> None:
     result("contains empty-state hint", "No alerts sent yet" in resp.text)
 
 
+async def test_7_inapp_generation_no_webhook(client, conn) -> None:
+    print("\n[7] test-alert with NO webhook → generated in-app, viewable with content")
+    from session import COOKIE_NAME
+    # SHOP_EMPTY has no webhook and no cooldown state yet in this run order?
+    # It was used in [5] without sending; safe to send now.
+    resp = await _post_test_alert(client, SHOP_EMPTY)
+    loc = resp.headers.get("location", "")
+    result("303 redirect with ta=inapp", resp.status_code == 303 and "ta=inapp" in loc, loc)
+
+    row = await conn.fetchrow(
+        """SELECT alert_type, success, status_detail, message_preview
+           FROM alert_deliveries WHERE shop_domain=$1 ORDER BY sent_at DESC LIMIT 1""",
+        SHOP_EMPTY,
+    )
+    result("row recorded with success=TRUE", row is not None and row["success"] is True,
+           f"detail={row['status_detail'] if row else None}")
+    result("status is generated in-app", "generated in-app" in (row["status_detail"] or ""))
+    result("message content stored", bool(row["message_preview"]) and "[TEST]" in row["message_preview"])
+
+    cookie = _make_session_cookie(SHOP_EMPTY)
+    page = await client.get(
+        f"{BASE_URL}/dashboard",
+        params={"shop": SHOP_EMPTY},
+        cookies={COOKIE_NAME: cookie},
+        follow_redirects=False,
+    )
+    result("dashboard shows Generated badge", "Generated" in page.text)
+    result("dashboard shows alert content viewer", "View alert content" in page.text)
+    result("alert text visible in page", "[TEST] CheckoutGuard is connected" in page.text)
+
+
 def test_6_wiring() -> None:
     print("\n[6] wiring: cooldown=60; every incident alert passes metadata to _post")
     from routes import dashboard as dash
@@ -212,6 +243,7 @@ async def main() -> None:
             await test_3_failed_delivery_recorded(client, conn)
             await test_4_dashboard_shows_history(client, conn)
             await test_5_empty_state(client, conn)
+            await test_7_inapp_generation_no_webhook(client, conn)
         test_6_wiring()
     finally:
         await _cleanup(conn)

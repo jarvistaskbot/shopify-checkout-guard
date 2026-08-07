@@ -9,7 +9,7 @@ Tests:
   3. Dashboard for webhook-less merchant → 200 HTML containing the
      Slack-not-connected banner.
   4. POST /dashboard/test-alert with no webhook → graceful 303 redirect with
-     ta=no_webhook, no 500.
+     ta=inapp (alert generated in-app), no 500.
 
 Run: PYTHONPATH='' .venv312/bin/python test_onboarding_skip.py
      (server must be running at http://localhost:8000; local Postgres must be running)
@@ -168,7 +168,7 @@ async def test_dashboard_shows_slack_banner_when_no_webhook(
 # 4. POST /dashboard/test-alert with no webhook → graceful 303, no 500
 # ---------------------------------------------------------------------------
 async def test_test_alert_no_webhook_graceful(client: httpx.AsyncClient, conn) -> None:
-    print("\n[4] POST /dashboard/test-alert with no webhook → 303 ta=no_webhook, no 500")
+    print("\n[4] POST /dashboard/test-alert with no webhook → 303 ta=inapp, no 500")
 
     from session import COOKIE_NAME
 
@@ -195,7 +195,7 @@ async def test_test_alert_no_webhook_graceful(client: httpx.AsyncClient, conn) -
         )
         result("Status is 303 (not 500)", r.status_code == 303, f"got {r.status_code}")
         loc = r.headers.get("location", "")
-        result("ta=no_webhook in redirect", "ta=no_webhook" in loc, f"location: {loc}")
+        result("ta=inapp in redirect (generated in-app)", "ta=inapp" in loc, f"location: {loc}")
     finally:
         if old_webhook:
             await conn.execute(

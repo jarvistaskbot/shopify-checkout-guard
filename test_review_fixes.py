@@ -10,7 +10,7 @@ Tests:
   6.  Dashboard: valid session cookie but merchant inactive → 302 to /auth/shopify
   7.  Webhook: POST /webhooks/orders/create without HMAC header → 401
   8.  Test-alert: POST /dashboard/test-alert without session → 302 to /auth/shopify
-  9.  Test-alert: POST /dashboard/test-alert without webhook configured → redirect ta=no_webhook
+  9.  Test-alert: POST /dashboard/test-alert without webhook configured → redirect ta=inapp (alert generated in-app)
   10. Test-alert: POST /dashboard/test-alert with rate limit → redirect ta=limit
   11. P1-4: RuntimeError check — dev secret_key + billing_test_mode=False raises at startup
   12. GET / with invalid shop domain → HTML (not redirect)
@@ -184,36 +184,35 @@ async def test_test_alert_no_session_redirects(client: httpx.AsyncClient) -> Non
 
 
 # ---------------------------------------------------------------------------
-# 9. Test-alert: no webhook configured → ta=no_webhook
+# 9. Test-alert: no webhook configured → ta=inapp (generated in-app)
 # ---------------------------------------------------------------------------
 async def test_test_alert_no_webhook(client: httpx.AsyncClient, conn) -> None:
-    print("\n[9] POST /dashboard/test-alert, no webhook → ta=no_webhook")
-    old_webhook = await conn.fetchval(
-        "SELECT slack_webhook_url FROM merchants WHERE shop_domain=$1", SHOP
-    )
+    print("\n[9] POST /dashboard/test-alert, no webhook → ta=inapp (generated in-app)")
+    # Use a dedicated shop: the in-app path stamps the shared in-memory rate
+    # limiter, and other suites exercise test-alert on the default SHOP.
+    shop9 = "cg-review-fix-9.myshopify.com"
+    await conn.execute("DELETE FROM merchants WHERE shop_domain=$1", shop9)
     await conn.execute(
-        "UPDATE merchants SET slack_webhook_url=NULL WHERE shop_domain=$1", SHOP
+        """INSERT INTO merchants (shop_domain, access_token, active, billing_status)
+           VALUES ($1, 'test-token', TRUE, 'active')""",
+        shop9,
     )
     try:
         from session import create_session_token, COOKIE_NAME, csrf_token_for
         from config import settings
-        session = create_session_token(SHOP, settings.secret_key)
+        session = create_session_token(shop9, settings.secret_key)
         csrf = csrf_token_for(session, settings.secret_key)
         r = await client.post(
             f"{BASE_URL}/dashboard/test-alert",
-            data={"shop": SHOP, "csrf_token": csrf},
+            data={"shop": shop9, "csrf_token": csrf},
             cookies={COOKIE_NAME: session},
             follow_redirects=False,
         )
         result("Status is 303", r.status_code == 303, f"got {r.status_code}")
         loc = r.headers.get("location", "")
-        result("ta=no_webhook in redirect", "ta=no_webhook" in loc, f"location: {loc}")
+        result("ta=inapp in redirect (alert generated in-app)", "ta=inapp" in loc, f"location: {loc}")
     finally:
-        if old_webhook:
-            await conn.execute(
-                "UPDATE merchants SET slack_webhook_url=$1 WHERE shop_domain=$2",
-                old_webhook, SHOP,
-            )
+        await conn.execute("DELETE FROM merchants WHERE shop_domain=$1", shop9)
 
 
 # ---------------------------------------------------------------------------

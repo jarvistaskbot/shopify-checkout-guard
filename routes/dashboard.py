@@ -186,7 +186,7 @@ async def dashboard(
         ) or 0
 
         recent_alerts = await conn.fetch(
-            """SELECT alert_type, incident_id, sent_at, success, status_detail
+            """SELECT alert_type, incident_id, sent_at, success, status_detail, message_preview
                FROM alert_deliveries WHERE shop_domain = $1
                ORDER BY sent_at DESC LIMIT 10""",
             shop,
@@ -389,11 +389,12 @@ def _render(
             f'Rate limit reached &mdash; you can send another test alert in about {wait_secs} seconds.'
             '</div>'
         )
-    elif test_alert_status == "no_webhook":
+    elif test_alert_status == "inapp":
         test_alert_banner_html = (
-            '<div class="banner banner-subscribe" style="margin-top:12px;">'
-            'No Slack webhook configured. '
-            f'<a href="/onboarding?shop={escape(shop)}">Update alert settings</a> first.'
+            '<div class="banner banner-ok" style="margin-top:12px;">'
+            'Test alert generated &mdash; see it in Recent Alerts below. '
+            f'<a href="/onboarding?shop={escape(shop)}">Connect Slack</a> '
+            'to also deliver alerts externally.'
             '</div>'
         )
     elif test_alert_status == "error":
@@ -428,16 +429,29 @@ def _render(
             type_label = _ALERT_TYPE_LABELS.get(
                 a["alert_type"], a["alert_type"].replace("_", " ").title()
             )
-            if a["success"]:
+            detail = a["status_detail"] or ""
+            if a["success"] and detail == "delivered":
                 delivery = '<span class="badge badge-resolved">Delivered to Slack</span>'
+            elif a["success"]:
+                delivery = '<span class="badge badge-resolved">Generated</span>'
             else:
-                detail = escape((a["status_detail"] or "delivery failed")[:80])
-                delivery = f'<span class="badge badge-active" title="{detail}">Failed</span>'
+                delivery = (
+                    f'<span class="badge badge-active" title="{escape(detail[:80])}">Failed</span>'
+                )
             incident_ref = f'#{a["incident_id"]}' if a["incident_id"] else "&mdash;"
+            preview_html = ""
+            if a["message_preview"]:
+                preview_html = (
+                    '<details style="margin-top:4px;"><summary style="cursor:pointer;'
+                    'font-size:12px;color:#008060;">View alert content</summary>'
+                    f'<pre style="white-space:pre-wrap;font-size:12px;background:#f7f7f7;'
+                    f'padding:8px;border-radius:6px;margin:6px 0 0;">'
+                    f'{escape(a["message_preview"])}</pre></details>'
+                )
             alert_rows += f"""
 <tr>
   <td>{_fmt_dt(a["sent_at"])}</td>
-  <td>{type_label}</td>
+  <td>{type_label}{preview_html}</td>
   <td>{incident_ref}</td>
   <td>{delivery}</td>
 </tr>"""
@@ -530,7 +544,13 @@ async def dashboard_test_alert(
         )
 
     if not row or not row["slack_webhook_url"]:
-        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=no_webhook", status_code=303)
+        # No Slack configured: still generate the test alert and record it so
+        # the complete alert pipeline is verifiable in-app, with no external
+        # account or credential required.
+        _test_alert_last_sent[shop] = now
+        from services.alerter import build_test_alert_text, record_in_app_alert
+        await record_in_app_alert(shop, "test", build_test_alert_text(shop))
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=inapp", status_code=303)
 
     # Stamp rate limiter before attempting send so errors also consume the cooldown.
     _test_alert_last_sent[shop] = now

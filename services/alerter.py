@@ -280,13 +280,17 @@ async def send_weekly_digest(
     await _send_email(to_email, subject, body)
 
 
+def build_test_alert_text(shop_domain: str) -> str:
+    return (
+        f":white_check_mark: *[TEST] CheckoutGuard is connected — {shop_domain}*\n"
+        f"This is a test alert. Your alert pipeline is working correctly.\n"
+        f"You will receive real alerts when CheckoutGuard detects revenue anomalies."
+    )
+
+
 async def send_test_alert(webhook_url: str, shop_domain: str) -> None:
     """Send a clearly-labelled [TEST] alert to verify the Slack integration."""
-    text = (
-        f":white_check_mark: *[TEST] CheckoutGuard is connected — {shop_domain}*\n"
-        f"This is a test alert. Your Slack integration is working correctly.\n"
-        f"You will receive real alerts here when CheckoutGuard detects revenue anomalies."
-    )
+    text = build_test_alert_text(shop_domain)
     await _post(webhook_url, text, shop_domain=shop_domain, alert_type="test")
 
 
@@ -296,6 +300,7 @@ async def _record_delivery(
     incident_id: Optional[int],
     success: bool,
     status_detail: str,
+    message_preview: Optional[str] = None,
 ) -> None:
     """Persist an alert delivery attempt. Never raises — history recording
     must not break alert delivery or the detection loop."""
@@ -307,12 +312,27 @@ async def _record_delivery(
         async with pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO alert_deliveries
-                       (shop_domain, alert_type, incident_id, success, status_detail)
-                   VALUES ($1, $2, $3, $4, $5)""",
+                       (shop_domain, alert_type, incident_id, success, status_detail, message_preview)
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
                 shop_domain, alert_type or "unknown", incident_id, success, status_detail[:200],
+                message_preview[:1000] if message_preview else None,
             )
     except Exception as exc:
         logger.warning("Failed to record alert delivery for %s: %s", shop_domain, exc)
+
+
+async def record_in_app_alert(
+    shop_domain: str,
+    alert_type: str,
+    text: str,
+    incident_id: Optional[int] = None,
+) -> None:
+    """Record an alert that was generated but has no external channel configured.
+    The alert is fully viewable in the dashboard's Recent Alerts panel."""
+    await _record_delivery(
+        shop_domain, alert_type, incident_id, True,
+        "generated in-app (Slack not connected)", text,
+    )
 
 
 async def _post(
@@ -329,9 +349,9 @@ async def _post(
             resp = await client.post(webhook_url, json={"text": text})
             resp.raise_for_status()
     except Exception as exc:
-        await _record_delivery(shop_domain, alert_type, incident_id, False, str(exc))
+        await _record_delivery(shop_domain, alert_type, incident_id, False, str(exc), text)
         raise
-    await _record_delivery(shop_domain, alert_type, incident_id, True, "delivered")
+    await _record_delivery(shop_domain, alert_type, incident_id, True, "delivered", text)
 
 
 async def _send_email(to_email: str, subject: str, body: str) -> None:
