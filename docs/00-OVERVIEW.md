@@ -5,8 +5,8 @@
 CheckoutGuard is a Shopify app that detects silent revenue bleed by monitoring real customer behavior — not synthetic tests. It runs 6 anomaly detectors in parallel and alerts merchants via Slack and email the moment their checkout funnel breaks, orders go silent, a payment gateway stalls, or a hot product runs out of stock.
 
 **Live URL:** https://checkoutguardalerts.com  
-**App Store status:** v1 under review (2026-07-09)  
-**v2 status:** feature branch `v2-feature-branch`, not deployed  
+**App Store status:** review #6 scheduled 2026-09-04 (see 13-REVIEW6-PLAYBOOK.md)  
+**Production:** v2 + v3 slow-bleed detector + credential-free review path live on main  
 
 ---
 
