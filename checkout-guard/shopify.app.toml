@@ -31,15 +31,17 @@ api_version = "2026-10"
   compliance_topics = [ "shop/redact" ]
   uri = "/webhooks/shop/redact"
 
-  # v2: inventory tracking (deploy ONLY after App Store approval + read_inventory scope granted)
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/inventory/update"
-  topics = [ "inventory_levels/update" ]
+  # v2 inventory tracking REMOVED for App Store submission (2026-09-15): requesting
+  # scopes/webhooks the reviewed app does not visibly use is a standard rejection
+  # reason. Re-add after approval:
+  #   [[webhooks.subscriptions]]
+  #   uri = "/webhooks/inventory/update"
+  #   topics = [ "inventory_levels/update" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-# v2 adds read_inventory + read_products (deploy ONLY after App Store approval + scope grant)
-scopes = "read_checkouts,read_orders,read_inventory,read_products"
+# v1 submission scopes only. v2 re-adds read_inventory + read_products AFTER approval.
+scopes = "read_checkouts,read_orders"
 
 [auth]
 redirect_urls = [ "https://checkoutguardalerts.com/auth/callback" ]
