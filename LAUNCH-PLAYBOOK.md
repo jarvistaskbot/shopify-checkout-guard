@@ -9,11 +9,11 @@ Legend: [YOU] = Arto in a dashboard/browser. [ME] = assistant does it on request
 
 ## STEP 0 — Money plumbing (tomorrow, 15 min, one-time)
 
-0.1 [YOU] Partner Dashboard → Settings → Taxes → start the tax interview.
-    - "Are you a US person?" → No → it produces a W-8BEN.
-    - Name: Artavazd Mnatsakanyan (must match payout account + profile).
-    - Country of tax residence: Armenia. Address: same as profile. Sign, submit.
-    - Result: no US backup withholding on payouts.
+0.1 [YOU] Taxes: NOTHING REQUIRED. (Correction 2026-09-15: Shopify Partners
+    have no W-8BEN interview — that's an Apple/Google pattern. The "Taxes"
+    block in Partner Settings only has OPTIONAL dropdowns for US tax
+    registration and EU VAT registration; Arto has neither → leave both
+    empty. If Shopify ever needs tax info, it prompts in the dashboard.)
 
 0.2 [YOU] Partner Dashboard → look for "Revenue share" / plan registration
     (may be under the app's Distribution or Partner settings).
