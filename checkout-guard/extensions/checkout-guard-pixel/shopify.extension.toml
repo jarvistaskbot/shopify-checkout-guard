@@ -8,5 +8,6 @@ uid = "a89899c5-9be4-b238-9be6-ec68010f89fa1dc4dee5"
 runtime_context = "strict"
 
   [extensions.settings]
-  # No custom settings — shop domain is read from init.data.shop.myshopifyDomain
-  # at runtime. The pixel is activated per-shop via webPixelCreate (settings="{}").
+  type = "object"
+
+  [extensions.settings.fields]
