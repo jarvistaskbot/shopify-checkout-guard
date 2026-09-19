@@ -1,19 +1,25 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: checkoutguard
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
+    # Bound to loopback only: the app reaches Postgres over the internal Docker
+    # network (db:5432), so the host port never needs to face the internet.
+    # Exposing 0.0.0.0:5432 put protected customer data one weak password away.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
   app:
     build: .
+    restart: unless-stopped
+    # Loopback only; nginx terminates TLS on the host and proxies to this port.
     ports:
-      - "9000:8000"
+      - "127.0.0.1:9000:8000"
     env_file: .env
     depends_on:
       - db
