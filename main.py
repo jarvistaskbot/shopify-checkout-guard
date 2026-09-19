@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -21,6 +22,15 @@ from routes.org import router as org_router
 from routes.pixel import router as pixel_router
 from routes.webhooks import router as webhook_router
 from services.detector import run_proactive_checks_all_merchants, run_proactive_checks_fast_merchants
+
+# Wire application loggers to stdout. Without this, only uvicorn's own access
+# logs surfaced and every logger.info/error in our routes/services went nowhere
+# — which is how the silent webPixelCreate failure stayed hidden for weeks.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -261,34 +261,43 @@ async def privacy_policy() -> HTMLResponse:
 </head>
 <body>
   <h1>Privacy Policy &mdash; CheckoutGuard</h1>
-  <p><em>Last updated: July 2026</em></p>
+  <p><em>Last updated: September 2026</em></p>
 
   <h2>What we collect</h2>
   <p>CheckoutGuard collects the minimum data required to detect revenue anomalies:</p>
   <ul>
     <li>Your Shopify store domain (e.g. <code>your-store.myshopify.com</code>)</li>
     <li>Order creation timestamps and order IDs (not customer names, emails, or payment details)</li>
+    <li>Checkout events from your storefront &mdash; when a checkout is started or
+        completed &mdash; captured via a Shopify Web Pixel. For each event we store an
+        opaque checkout token, the associated order ID, the order total amount, and a
+        timestamp. We do not receive or store the customer's name, email, phone,
+        address, or payment details.</li>
     <li>Your Slack Incoming Webhook URL (used only to send you alerts)</li>
   </ul>
 
   <h2>What we do not collect</h2>
   <ul>
-    <li>Customer names, email addresses, or any PII</li>
+    <li>Customer names, email addresses, phone numbers, or shipping/billing addresses</li>
+    <li>Any other personally identifiable customer information (PII)</li>
     <li>Payment or billing card data</li>
   </ul>
 
   <h2>How we use your data</h2>
   <p>
-    Order timestamps are used solely to compute a rolling baseline of your normal order volume.
-    When the volume drops significantly, we send an alert to your configured Slack channel.
-    We do not share, sell, or use your data for any other purpose.
+    Order and checkout event timestamps are used solely to compute a rolling baseline of
+    your normal checkout and order volume. When the funnel breaks, order volume drops
+    significantly, or checkout abandonment spikes, we send an alert to your configured
+    Slack channel. We do not share, sell, rent, or use your data for advertising,
+    profiling, or any purpose other than delivering these alerts to you.
   </p>
 
   <h2>Data retention</h2>
   <p>
-    Checkout event records older than 90 days are automatically purged.
+    Checkout and order event records older than 90 days are automatically purged.
     When you uninstall CheckoutGuard, your store data is deleted within 48 hours upon
-    receipt of the Shopify <code>shop/redact</code> webhook.
+    receipt of the Shopify <code>shop/redact</code> webhook. You may also request
+    deletion at any time via the contact address below.
   </p>
 
   <h2>Contact</h2>
