@@ -3,7 +3,7 @@
 client_id = "4e9e166367e80c062d31c73303a085bc"
 name = "CheckoutGuard"
 application_url = "https://checkoutguardalerts.com"
-embedded = true
+embedded = false
 
 [build]
 automatically_update_urls_on_dev = false
