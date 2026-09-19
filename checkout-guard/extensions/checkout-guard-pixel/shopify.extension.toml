@@ -4,6 +4,7 @@ api_version = "2024-10"
 type = "web_pixel"
 name = "CheckoutGuard Pixel"
 handle = "checkout-guard-pixel"
+uid = "a89899c5-9be4-b238-9be6-ec68010f89fa1dc4dee5"
 runtime_context = "strict"
 
   [extensions.settings]
