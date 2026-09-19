@@ -30,7 +30,7 @@ from session import create_session_token, COOKIE_NAME
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth")
 
-_SCOPES = "read_orders,read_checkouts,write_pixels"
+_SCOPES = "read_orders,read_checkouts,write_pixels,read_customer_events"
 _NONCE_TTL_MINUTES = 15
 
 # Valid *.myshopify.com shop domains only (used before echoing shop into URLs).
@@ -278,8 +278,8 @@ async def _subscribe_webhooks(shop: str) -> None:
 async def _activate_web_pixel(shop: str) -> None:
     """Call webPixelCreate so the CheckoutGuard Pixel extension activates for this shop."""
     _MUTATION = """
-    mutation webPixelCreate($settings: String!) {
-      webPixelCreate(settings: $settings) {
+    mutation webPixelCreate($webPixel: WebPixelInput!) {
+      webPixelCreate(webPixel: $webPixel) {
         webPixel { id }
         userErrors { code field message }
       }
@@ -303,10 +303,17 @@ async def _activate_web_pixel(shop: str) -> None:
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json",
                 },
-                json={"query": _MUTATION, "variables": {"settings": "{}"}},
+                json={"query": _MUTATION, "variables": {"webPixel": {"settings": "{}"}}},
             )
             data = resp.json()
-            errors = data.get("data", {}).get("webPixelCreate", {}).get("userErrors", [])
+            # Top-level GraphQL errors (bad query, missing scope) come outside
+            # "data" — treating them as success is how this bug hid for weeks.
+            top_errors = data.get("errors")
+            if top_errors:
+                logger.error("webPixelCreate GraphQL errors for %s: %s", shop, top_errors)
+                return
+            result = (data.get("data") or {}).get("webPixelCreate") or {}
+            errors = result.get("userErrors", [])
             if errors:
                 codes = [e.get("code") for e in errors]
                 if any(c in ("PIXEL_ALREADY_EXISTS", "WEB_PIXEL_ALREADY_EXISTS") for c in codes):
@@ -314,12 +321,7 @@ async def _activate_web_pixel(shop: str) -> None:
                 else:
                     logger.error("webPixelCreate errors for %s: %s", shop, errors)
             else:
-                pixel_id = (
-                    data.get("data", {})
-                    .get("webPixelCreate", {})
-                    .get("webPixel", {})
-                    .get("id")
-                )
+                pixel_id = (result.get("webPixel") or {}).get("id")
                 logger.info("webPixelCreate: activated for %s (id=%s)", shop, pixel_id)
     except Exception as exc:
         logger.error("webPixelCreate failed for %s: %s", shop, exc)

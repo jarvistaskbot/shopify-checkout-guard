@@ -41,9 +41,10 @@ api_version = "2026-10"
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 # v1 submission scopes only. v2 re-adds read_inventory + read_products AFTER approval.
-# write_pixels is required for webPixelCreate — without it the pixel extension
-# never activates and checkout_started events never arrive.
-scopes = "read_checkouts,read_orders,write_pixels"
+# write_pixels + read_customer_events are both required for webPixelCreate —
+# without them the pixel extension never activates and checkout_started events
+# never arrive (Shopify: "requires read_customer_events access scope").
+scopes = "read_checkouts,read_orders,write_pixels,read_customer_events"
 
 [auth]
 redirect_urls = [ "https://checkoutguardalerts.com/auth/callback" ]
