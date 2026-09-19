@@ -1,5 +1,4 @@
-import { register } from "@shopify/web-pixels-manager";
-
+// register is injected as a global by Shopify's web pixel sandbox runtime
 register(({ analytics, browser, init }) => {
   const shop = init.data.shop.myshopifyDomain;
   const ENDPOINT = "https://checkoutguardalerts.com/pixel-events";
