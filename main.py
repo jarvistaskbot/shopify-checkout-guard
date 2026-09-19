@@ -7,9 +7,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from config import settings
 from database import create_pool, get_pool
@@ -284,23 +282,41 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-class _EmbedReadyMiddleware(BaseHTTPMiddleware):
+class _EmbedReadyMiddleware:
     """Set CSP frame-ancestors for Shopify admin embedding on all HTML responses.
 
-    This is additive (embed-ready but not yet embedded=true). X-Frame-Options
-    is explicitly removed so Shopify's admin iframe is never blocked.
+    Pure ASGI middleware (no BaseHTTPMiddleware) — intercepts http.response.start
+    to add the CSP header without buffering the body, avoiding Content-Length
+    mismatches on streaming responses.
     """
 
-    async def dispatch(self, request: StarletteRequest, call_next):
-        response = await call_next(request)
-        content_type = response.headers.get("content-type", "")
-        if "text/html" in content_type:
-            response.headers["Content-Security-Policy"] = (
-                "frame-ancestors https://*.myshopify.com https://admin.shopify.com"
-            )
-            if "x-frame-options" in response.headers:
-                del response.headers["x-frame-options"]
-        return response
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_csp(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                content_type = b""
+                for k, v in headers:
+                    if k.lower() == b"content-type":
+                        content_type = v
+                        break
+                if b"text/html" in content_type:
+                    _csp = b"frame-ancestors https://*.myshopify.com https://admin.shopify.com"
+                    headers = [
+                        (k, v) for k, v in headers
+                        if k.lower() not in (b"x-frame-options", b"content-security-policy")
+                    ]
+                    headers.append((b"content-security-policy", _csp))
+                    message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_csp)
 
 
 app = FastAPI(title="CheckoutGuard", lifespan=lifespan)
