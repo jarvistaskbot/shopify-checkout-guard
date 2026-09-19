@@ -3,4 +3,5 @@ api_version = "2024-10"
 [[extensions]]
 name = "CheckoutGuard Error Tracker"
 handle = "error-tracker"
+uid = "de1070c6-7328-a444-b3d5-850a3e1373cd3dfe3d42"
 type = "theme_app_extension"

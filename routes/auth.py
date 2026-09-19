@@ -183,11 +183,12 @@ async def callback(
             token_expires_at,
         )
 
-    # Run non-blocking tasks: webhook registration and AOV fetch.
+    # Run non-blocking tasks: webhook registration, AOV fetch, and pixel activation.
     # These fetch a valid (expiring) token themselves — the raw OAuth token is
     # non-expiring and Shopify's Admin API now rejects it.
     asyncio.create_task(_subscribe_webhooks(shop))
     asyncio.create_task(_fetch_and_store_aov(shop))
+    asyncio.create_task(_activate_web_pixel(shop))
 
     # Determine redirect destination.
     pool2 = await get_pool()
@@ -272,6 +273,56 @@ async def _subscribe_webhooks(shop: str) -> None:
                 logger.info("Registered webhook: %s", topic)
             else:
                 logger.error("Failed to register %s: %s", topic, resp.text)
+
+
+async def _activate_web_pixel(shop: str) -> None:
+    """Call webPixelCreate so the CheckoutGuard Pixel extension activates for this shop."""
+    _MUTATION = """
+    mutation webPixelCreate($settings: String!) {
+      webPixelCreate(settings: $settings) {
+        webPixel { id }
+        userErrors { code field message }
+      }
+    }
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            access_token = await get_valid_token(
+                conn, shop, settings.shopify_api_key, settings.shopify_api_secret
+            )
+    except Exception as exc:
+        logger.error("_activate_web_pixel: token unavailable for %s: %s", shop, exc)
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://{shop}/admin/api/2024-10/graphql.json",
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+                json={"query": _MUTATION, "variables": {"settings": "{}"}},
+            )
+            data = resp.json()
+            errors = data.get("data", {}).get("webPixelCreate", {}).get("userErrors", [])
+            if errors:
+                codes = [e.get("code") for e in errors]
+                if any(c in ("PIXEL_ALREADY_EXISTS", "WEB_PIXEL_ALREADY_EXISTS") for c in codes):
+                    logger.info("webPixelCreate: already activated for %s", shop)
+                else:
+                    logger.error("webPixelCreate errors for %s: %s", shop, errors)
+            else:
+                pixel_id = (
+                    data.get("data", {})
+                    .get("webPixelCreate", {})
+                    .get("webPixel", {})
+                    .get("id")
+                )
+                logger.info("webPixelCreate: activated for %s (id=%s)", shop, pixel_id)
+    except Exception as exc:
+        logger.error("webPixelCreate failed for %s: %s", shop, exc)
 
 
 async def _fetch_and_store_aov(shop: str) -> None:

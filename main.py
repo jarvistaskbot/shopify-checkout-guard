@@ -7,6 +7,9 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.types import ASGIApp
 
 from config import settings
 from database import create_pool, get_pool
@@ -17,6 +20,7 @@ from routes.dashboard import router as dashboard_router
 from routes.events import router as events_router
 from routes.onboarding import router as onboarding_router
 from routes.org import router as org_router
+from routes.pixel import router as pixel_router
 from routes.webhooks import router as webhook_router
 from services.detector import run_proactive_checks_all_merchants, run_proactive_checks_fast_merchants
 
@@ -280,7 +284,27 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
+class _EmbedReadyMiddleware(BaseHTTPMiddleware):
+    """Set CSP frame-ancestors for Shopify admin embedding on all HTML responses.
+
+    This is additive (embed-ready but not yet embedded=true). X-Frame-Options
+    is explicitly removed so Shopify's admin iframe is never blocked.
+    """
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        content_type = response.headers.get("content-type", "")
+        if "text/html" in content_type:
+            response.headers["Content-Security-Policy"] = (
+                "frame-ancestors https://*.myshopify.com https://admin.shopify.com"
+            )
+            if "x-frame-options" in response.headers:
+                del response.headers["x-frame-options"]
+        return response
+
+
 app = FastAPI(title="CheckoutGuard", lifespan=lifespan)
+app.add_middleware(_EmbedReadyMiddleware)
 
 app.include_router(auth_router)
 app.include_router(billing_router)
@@ -288,6 +312,7 @@ app.include_router(dashboard_router)
 app.include_router(events_router)
 app.include_router(onboarding_router)
 app.include_router(org_router)
+app.include_router(pixel_router)
 app.include_router(webhook_router)
 
 

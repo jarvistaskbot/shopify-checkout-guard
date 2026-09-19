@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import settings
 from database import get_pool
-from session import COOKIE_NAME, csrf_token_for, verify_session_token
+from session import COOKIE_NAME, csrf_token_for, verify_session_token, verify_shopify_session_token
 
 # In-memory rate limiter for test-alert: maps shop_domain → unix timestamp of last send.
 _test_alert_last_sent: Dict[str, float] = {}
@@ -93,14 +93,34 @@ _ALERT_TYPE_LABELS = {
 
 
 def _require_session(request: Request, shop: str):
-    """Return shop from cookie or raise RedirectResponse to OAuth."""
+    """Return shop if authenticated via cookie (standalone) OR App Bridge JWT (embedded)."""
+    # Standalone mode: HMAC-signed session cookie.
     cookie_val = request.cookies.get(COOKIE_NAME)
-    if not cookie_val:
-        return None
-    verified_shop = verify_session_token(cookie_val, settings.secret_key)
-    if not verified_shop or verified_shop != shop:
-        return None
-    return verified_shop
+    if cookie_val:
+        verified_shop = verify_session_token(cookie_val, settings.secret_key)
+        if verified_shop and verified_shop == shop:
+            return verified_shop
+
+    # Embedded mode: App Bridge session token (JWT sent in Authorization header
+    # or id-token query param).
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        verified_shop = verify_shopify_session_token(
+            token, settings.shopify_api_secret, settings.shopify_api_key
+        )
+        if verified_shop and verified_shop == shop:
+            return verified_shop
+
+    id_token = request.query_params.get("id-token", "")
+    if id_token:
+        verified_shop = verify_shopify_session_token(
+            id_token, settings.shopify_api_secret, settings.shopify_api_key
+        )
+        if verified_shop and verified_shop == shop:
+            return verified_shop
+
+    return None
 
 
 def _fmt_dt(dt: datetime) -> str:
@@ -132,8 +152,9 @@ async def dashboard(
     shop: str = Query(...),
     ta: str = Query(default=""),
     w: int = Query(default=0),
+    host: str = Query(default=""),
 ) -> HTMLResponse:
-    # Verify session cookie.
+    # Verify session (cookie for standalone, JWT for embedded).
     if not _require_session(request, shop):
         return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
 
@@ -142,7 +163,8 @@ async def dashboard(
         merchant = await conn.fetchrow(
             """SELECT shop_domain, installed_at, slack_webhook_url, alert_email,
                       billing_status, trial_ends_at, plan,
-                      orders_month, orders_month_reset_at
+                      orders_month, orders_month_reset_at,
+                      review_banner_impressions, review_banner_dismissed
                FROM merchants WHERE shop_domain = $1 AND active = TRUE""",
             shop,
         )
@@ -221,6 +243,18 @@ async def dashboard(
     cookie_val = request.cookies.get(COOKIE_NAME, "")
     csrf = csrf_token_for(cookie_val, settings.secret_key)
 
+    # Review banner: show if merchant is >14 days old, impressions < 3, not dismissed.
+    impressions = merchant["review_banner_impressions"] or 0
+    dismissed = merchant["review_banner_dismissed"] or False
+    show_review_banner = (
+        days_active >= 14
+        and not dismissed
+        and impressions < 3
+    )
+    if show_review_banner:
+        import asyncio
+        asyncio.create_task(_increment_review_banner(shop))
+
     return HTMLResponse(content=_render(
         shop=shop,
         calibrating=calibrating,
@@ -240,6 +274,8 @@ async def dashboard(
         test_alert_status=ta,
         test_alert_wait_secs=w,
         recent_alerts=list(recent_alerts),
+        show_review_banner=show_review_banner,
+        host=host,
     ))
 
 
@@ -262,6 +298,8 @@ def _render(
     test_alert_status: str = "",
     test_alert_wait_secs: int = 0,
     recent_alerts: Optional[list] = None,
+    show_review_banner: bool = False,
+    host: str = "",
 ) -> str:
     safe_shop = escape(shop)
     conversion_rate = (
@@ -481,6 +519,40 @@ def _render(
             f"</div>"
         )
 
+    # App Bridge CDN: only inject when embedded params are present so the
+    # standalone dashboard is completely unaffected by the script.
+    app_bridge_script = ""
+    if host and safe_shop:
+        _CLIENT_ID = "4e9e166367e80c062d31c73303a085bc"
+        app_bridge_script = (
+            f'<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"'
+            f' data-api-key="{_CLIENT_ID}"></script>'
+        )
+
+    # Review-request banner (Fix C). App Store handle must be confirmed by Arto
+    # from his listing URL at https://apps.shopify.com/<handle>.
+    _APP_STORE_HANDLE = "YOUR_APP_STORE_HANDLE"  # TODO: Arto must confirm this
+    review_banner_html = ""
+    if show_review_banner:
+        review_url = f"https://apps.shopify.com/{_APP_STORE_HANDLE}/reviews"
+        review_banner_html = f"""
+<div class="banner banner-info" id="review-banner"
+     style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+  <span>
+    Enjoying CheckoutGuard? A quick review on the App Store helps other merchants find us
+    &mdash; it takes 30 seconds and means a lot.
+    <a href="{review_url}" target="_blank" rel="noopener"
+       style="color:#1a3a6b;font-weight:700;">Leave a review &rarr;</a>
+  </span>
+  <form method="POST" action="/dashboard/dismiss-review-banner" style="margin:0;flex-shrink:0;">
+    <input type="hidden" name="shop" value="{safe_shop}" />
+    <input type="hidden" name="csrf_token" value="{escape(csrf_token)}" />
+    <button type="submit"
+      style="background:none;border:none;cursor:pointer;color:#1a3a6b;font-size:18px;
+             line-height:1;padding:0 4px;" title="Dismiss">&times;</button>
+  </form>
+</div>"""
+
     safe_plan = escape(plan_name)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -488,6 +560,7 @@ def _render(
   <meta charset="UTF-8" />
   <title>CheckoutGuard — Dashboard</title>
   <style>{_STYLE}</style>
+  {app_bridge_script}
 </head>
 <body>
   <h1>CheckoutGuard Dashboard</h1>
@@ -498,6 +571,7 @@ def _render(
   {slack_missing_banner_html}
   {billing_banner_html}
   {order_cap_banner_html}
+  {review_banner_html}
   {stats_html}
   <h2>Last 7 Days — Incidents</h2>
   {table_html}
@@ -562,3 +636,45 @@ async def dashboard_test_alert(
         return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=error", status_code=303)
 
     return RedirectResponse(url=f"/dashboard?shop={quote(shop)}&ta=sent", status_code=303)
+
+
+async def _increment_review_banner(shop: str) -> None:
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE merchants
+                   SET review_banner_impressions = review_banner_impressions + 1
+                   WHERE shop_domain = $1""",
+                shop,
+            )
+    except Exception as exc:
+        logger.error("review_banner impression increment failed for %s: %s", shop, exc)
+
+
+@router.post("/dashboard/dismiss-review-banner")
+async def dismiss_review_banner(
+    request: Request,
+    shop: str = Form(...),
+    csrf_token: Optional[str] = Form(default=None),
+) -> RedirectResponse:
+    """Permanently dismiss the review-request banner for this merchant."""
+    if not _require_session(request, shop):
+        return RedirectResponse(url=f"/auth/shopify?shop={escape(shop)}", status_code=302)
+
+    cookie_val = request.cookies.get(COOKIE_NAME, "")
+    expected_csrf = csrf_token_for(cookie_val, settings.secret_key)
+    if not csrf_token or csrf_token != expected_csrf:
+        return RedirectResponse(url=f"/dashboard?shop={quote(shop)}", status_code=302)
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE merchants SET review_banner_dismissed = TRUE WHERE shop_domain = $1",
+                shop,
+            )
+    except Exception as exc:
+        logger.error("review_banner dismiss failed for %s: %s", shop, exc)
+
+    return RedirectResponse(url=f"/dashboard?shop={quote(shop)}", status_code=303)

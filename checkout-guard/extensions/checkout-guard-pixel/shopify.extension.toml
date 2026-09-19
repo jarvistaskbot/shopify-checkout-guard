@@ -1,0 +1,11 @@
+api_version = "2024-10"
+
+[[extensions]]
+type = "web_pixel"
+name = "CheckoutGuard Pixel"
+handle = "checkout-guard-pixel"
+runtime_context = "strict"
+
+  [extensions.settings]
+  # No custom settings — shop domain is read from init.data.shop.myshopifyDomain
+  # at runtime. The pixel is activated per-shop via webPixelCreate (settings="{}").
