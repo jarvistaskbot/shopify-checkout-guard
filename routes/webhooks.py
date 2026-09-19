@@ -70,15 +70,25 @@ async def order_created(
                 logger.debug("orders/create for unknown/inactive shop %s — skipped", x_shopify_shop_domain)
                 return {"ok": True}
 
-            await conn.execute(
+            # Shopify redelivers webhooks (retries can arrive ms apart); the
+            # partial unique index makes the duplicate a no-op so order counts
+            # and line items are not inflated.
+            inserted = await conn.fetchval(
                 """
                 INSERT INTO checkout_events (shop_domain, event_type, checkout_token, order_id)
                 VALUES ($1, 'order_created', $2, $3)
+                ON CONFLICT (shop_domain, order_id)
+                    WHERE event_type = 'order_created' AND order_id <> ''
+                    DO NOTHING
+                RETURNING id
                 """,
                 x_shopify_shop_domain,
                 checkout_token,
                 order_id,
             )
+            if inserted is None:
+                logger.info("orders/create duplicate delivery for %s order %s — skipped", x_shopify_shop_domain, order_id)
+                return {"ok": True}
 
             # Store line items for hot-product OOS detection (v2).
             line_items = payload.get("line_items", [])

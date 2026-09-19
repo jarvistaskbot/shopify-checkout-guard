@@ -30,7 +30,7 @@ from session import create_session_token, COOKIE_NAME
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth")
 
-_SCOPES = "read_orders,read_checkouts"
+_SCOPES = "read_orders,read_checkouts,write_pixels"
 _NONCE_TTL_MINUTES = 15
 
 # Valid *.myshopify.com shop domains only (used before echoing shop into URLs).
